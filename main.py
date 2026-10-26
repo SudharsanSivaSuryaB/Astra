@@ -101,6 +101,8 @@ except ImportError:
 
 
 class SpeechWorker(QThread):
+    speech_started = Signal(str)
+
     def __init__(self, text, edge_playback):
         super().__init__()
         self.text = text
@@ -123,8 +125,17 @@ class SpeechWorker(QThread):
                     raise RuntimeError("Windows does not expose an installed Aria voice to SAPI.")
                 engine.setProperty("voice", aria.id)
                 engine.setProperty("rate", 190)
+                started = {"value": False}
+
+                def on_started(_name):
+                    started["value"] = True
+                    self.speech_started.emit(self.text)
+
+                engine.connect("started-utterance", on_started)
                 engine.say(self.text)
                 engine.runAndWait()
+                if not started["value"]:
+                    self.speech_started.emit(self.text)
                 self.success = True
                 return
             except (OSError, subprocess.SubprocessError) as exc:
@@ -135,6 +146,7 @@ class SpeechWorker(QThread):
         # Use online Aria only when local Windows Aria is unavailable.
         if os.path.isfile(self.edge_playback):
             try:
+                self.speech_started.emit(self.text)
                 subprocess.run(
                     [
                         self.edge_playback,
@@ -234,12 +246,12 @@ class NotesWindow:
         self.user32.EnumWindows.restype = wintypes.BOOL
         self.user32.IsWindowVisible.argtypes = (wintypes.HWND,)
         self.user32.IsWindowVisible.restype = wintypes.BOOL
-        self.user32.IsIconic.argtypes = (wintypes.HWND,)
-        self.user32.IsIconic.restype = wintypes.BOOL
         self.user32.GetWindowTextLengthW.argtypes = (wintypes.HWND,)
         self.user32.GetWindowTextLengthW.restype = ctypes.c_int
         self.user32.GetWindowTextW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
         self.user32.GetWindowTextW.restype = ctypes.c_int
+        self.user32.IsIconic.argtypes = (wintypes.HWND,)
+        self.user32.IsIconic.restype = wintypes.BOOL
         self.user32.GetWindowThreadProcessId.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
         self.user32.GetWindowThreadProcessId.restype = wintypes.DWORD
         self.user32.IsWindow.argtypes = (wintypes.HWND,)
@@ -482,6 +494,12 @@ class ChromeController:
         self.user32.EnumWindows.restype = wintypes.BOOL
         self.user32.IsWindowVisible.argtypes = (wintypes.HWND,)
         self.user32.IsWindowVisible.restype = wintypes.BOOL
+        self.user32.GetWindowTextLengthW.argtypes = (wintypes.HWND,)
+        self.user32.GetWindowTextLengthW.restype = ctypes.c_int
+        self.user32.GetWindowTextW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+        self.user32.GetWindowTextW.restype = ctypes.c_int
+        self.user32.IsIconic.argtypes = (wintypes.HWND,)
+        self.user32.IsIconic.restype = wintypes.BOOL
         self.user32.GetClassNameW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
         self.user32.GetClassNameW.restype = ctypes.c_int
         self.user32.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
@@ -560,6 +578,21 @@ class ChromeController:
         self.focus()
         self._send_key_chord(*keys)
 
+    def shortcut_foreground(self, *keys):
+        """Send a shortcut to the current app without switching to Chrome."""
+        self._send_key_chord(*keys)
+
+    def foreground_title(self):
+        hwnd = self.user32.GetForegroundWindow()
+        if not hwnd:
+            return ""
+        title_length = self.user32.GetWindowTextLengthW(hwnd)
+        if title_length <= 0:
+            return ""
+        title = ctypes.create_unicode_buffer(title_length + 1)
+        self.user32.GetWindowTextW(hwnd, title, len(title))
+        return title.value
+
     def _send_key_chord(self, *keys):
         events = []
         for key in keys:
@@ -609,6 +642,197 @@ class ChromeController:
             return False
         self.user32.PostMessageW(hwnd, self.WM_CLOSE, 0, 0)
         return True
+
+class WindowsAppController:
+    """Resolve common Windows apps and Start Menu shortcuts by spoken name."""
+    WM_CLOSE = 0x0010
+    SW_MINIMIZE = 6
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+    @staticmethod
+    def normalize_name(value):
+        return " ".join(re.sub(r"[^a-z0-9 ]+", " ", value.lower()).split())
+
+    @classmethod
+    def aliases(cls, target):
+        normalized = cls.normalize_name(target)
+        if normalized in ("files", "file", "file explorer", "explorer", "windows explorer"):
+            return "explorer"
+        if normalized in (
+            "edge", "microsoft edge", "ed", "age", "eddge", "ed age",
+            "microsoft ed", "microsoft age", "microsoft eddge", "microsoft ed age",
+        ):
+            return "edge"
+        if normalized in ("store", "microsoft store", "windows store"):
+            return "store"
+        if normalized in ("settings", "windows settings", "system settings", "computer settings"):
+            return "settings"
+        return normalized
+
+    @staticmethod
+    def start_menu_roots():
+        return tuple(path for path in (
+            os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs"),
+            os.path.join(os.environ.get("PROGRAMDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs"),
+        ) if path and os.path.isdir(path))
+
+    @classmethod
+    def find_start_menu_shortcut(cls, target):
+        normalized_target = cls.normalize_name(target)
+        candidates = []
+        for root in cls.start_menu_roots():
+            for folder, _, filenames in os.walk(root):
+                for filename in filenames:
+                    if not filename.lower().endswith(".lnk"):
+                        continue
+                    stem = cls.normalize_name(os.path.splitext(filename)[0])
+                    if stem == normalized_target:
+                        return os.path.join(folder, filename)
+                    if normalized_target in stem or stem in normalized_target:
+                        candidates.append((len(stem), os.path.join(folder, filename)))
+        if candidates:
+            return sorted(candidates)[0][1]
+        return None
+
+    @classmethod
+    def open_app(cls, target):
+        if os.name != "nt":
+            raise RuntimeError("Dynamic app commands are supported on Windows only.")
+        alias = cls.aliases(target)
+        if alias == "explorer":
+            subprocess.Popen(["explorer.exe"], close_fds=True)
+            return "File Explorer"
+        if alias == "edge":
+            executable = shutil.which("msedge.exe") or shutil.which("msedge")
+            if not executable:
+                for root in (os.environ.get("PROGRAMFILES(X86)"), os.environ.get("PROGRAMFILES")):
+                    if root:
+                        candidate = os.path.join(root, "Microsoft", "Edge", "Application", "msedge.exe")
+                        if os.path.isfile(candidate):
+                            executable = candidate
+                            break
+            if executable:
+                subprocess.Popen([executable], close_fds=True)
+                return "Microsoft Edge"
+        if alias == "store":
+            os.startfile("ms-windows-store:")
+            return "Microsoft Store"
+        if alias == "settings":
+            os.startfile("ms-settings:")
+            return "Windows Settings"
+
+        shortcut = cls.find_start_menu_shortcut(target)
+        if shortcut:
+            os.startfile(shortcut)
+            return os.path.splitext(os.path.basename(shortcut))[0]
+        executable = shutil.which(target)
+        if executable:
+            subprocess.Popen([executable], close_fds=True)
+            return target
+        raise RuntimeError(f"I couldn't find an installed app or Start Menu shortcut named {target}.")
+
+    @classmethod
+    def _process_image(cls, pid):
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.QueryFullProcessImageNameW.argtypes = (
+            wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)
+        )
+        kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        handle = kernel32.OpenProcess(cls.PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return ""
+        try:
+            size = wintypes.DWORD(32768)
+            image_path = ctypes.create_unicode_buffer(size.value)
+            if kernel32.QueryFullProcessImageNameW(handle, 0, image_path, ctypes.byref(size)):
+                return image_path.value
+            return ""
+        finally:
+            kernel32.CloseHandle(handle)
+
+    @classmethod
+    def close_app(cls, target):
+        if os.name != "nt":
+            raise RuntimeError("Dynamic app commands are supported on Windows only.")
+        alias = cls.aliases(target)
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.EnumWindows.argtypes = (
+            ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM),
+            wintypes.LPARAM,
+        )
+        user32.EnumWindows.restype = wintypes.BOOL
+        user32.IsWindowVisible.argtypes = (wintypes.HWND,)
+        user32.IsWindowVisible.restype = wintypes.BOOL
+        user32.GetWindowTextLengthW.argtypes = (wintypes.HWND,)
+        user32.GetWindowTextLengthW.restype = ctypes.c_int
+        user32.GetWindowTextW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+        user32.GetWindowTextW.restype = ctypes.c_int
+        user32.GetWindowThreadProcessId.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        user32.GetClassNameW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+        user32.PostMessageW.argtypes = (wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+
+        matches = []
+        callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def visit(hwnd, _):
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            title_buffer = ctypes.create_unicode_buffer(user32.GetWindowTextLengthW(hwnd) + 1)
+            user32.GetWindowTextW(hwnd, title_buffer, len(title_buffer))
+            title = cls.normalize_name(title_buffer.value)
+            class_buffer = ctypes.create_unicode_buffer(128)
+            user32.GetClassNameW(hwnd, class_buffer, len(class_buffer))
+            class_name = class_buffer.value.lower()
+            process_id = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
+            image_name = os.path.basename(cls._process_image(process_id.value)).lower()
+
+            if alias == "explorer":
+                matched = class_name in ("cabinetwclass", "explorewclass")
+            elif alias == "edge":
+                matched = image_name == "msedge.exe"
+            elif alias == "store":
+                matched = "microsoft store" in title or "windows store" in title
+            else:
+                matched = alias in title or alias in cls.normalize_name(image_name.removesuffix(".exe"))
+            if matched:
+                matches.append(hwnd)
+            return True
+
+        callback = callback_type(visit)
+        user32.EnumWindows(callback, 0)
+        for hwnd in matches:
+            user32.PostMessageW(hwnd, cls.WM_CLOSE, 0, 0)
+        return bool(matches)
+
+    @classmethod
+    def minimize_foreground_app(cls, fallback_hwnd=None):
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        user32.GetWindowTextLengthW.argtypes = (wintypes.HWND,)
+        user32.GetWindowTextLengthW.restype = ctypes.c_int
+        user32.GetWindowTextW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+        user32.GetWindowTextW.restype = ctypes.c_int
+        user32.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
+
+        hwnd = user32.GetForegroundWindow()
+        if hwnd:
+            title_length = user32.GetWindowTextLengthW(hwnd)
+            title = ctypes.create_unicode_buffer(title_length + 1)
+            user32.GetWindowTextW(hwnd, title, len(title))
+            if "desktop ai assistant" in title.value.lower() and fallback_hwnd:
+                hwnd = fallback_hwnd
+        if not hwnd:
+            hwnd = fallback_hwnd
+        if not hwnd:
+            raise RuntimeError("I couldn't find an active application window to minimize.")
+        user32.ShowWindow(hwnd, cls.SW_MINIMIZE)
+        return True
+
 
 class VoiceListener(QThread):
     command = Signal(str)
@@ -768,6 +992,11 @@ class CharacterArt(QWidget):
         super().__init__(parent)
         self.setMinimumSize(210, 260)
         self.blink = False
+        self.speaking = False
+        self.phase = 0
+        self.speech_timer = QTimer(self)
+        self.speech_timer.timeout.connect(self.animate_speech)
+        self.speech_timer.start(120)
         self.blink_timer = QTimer(self)
         self.blink_timer.timeout.connect(self.toggle_blink)
         self.blink_timer.start(2800)
@@ -776,6 +1005,21 @@ class CharacterArt(QWidget):
         self.blink = True
         self.update()
         QTimer.singleShot(140, self.open_eyes)
+
+    def set_speaking(self, speaking):
+        self.speaking = speaking
+        if speaking:
+            self.phase = 0
+            self.speech_timer.setInterval(45)
+        else:
+            self.speech_timer.setInterval(120)
+        if not self.speech_timer.isActive():
+            self.speech_timer.start()
+        self.update()
+
+    def animate_speech(self):
+        self.phase = (self.phase + 9) % 360
+        self.update()
 
     def open_eyes(self):
         self.blink = False
@@ -786,7 +1030,8 @@ class CharacterArt(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         # subtle holographic glow
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(0, 205, 255, 24))
+        glow_alpha = 34 if self.phase % 120 < 60 else 20
+        p.setBrush(QColor(0, 205, 255, glow_alpha))
         p.drawEllipse(29, 22, 152, 152)
         p.setBrush(QColor(0, 205, 255, 14))
         p.drawEllipse(42, 35, 126, 126)
@@ -798,8 +1043,11 @@ class CharacterArt(QWidget):
         p.setPen(QPen(QColor("#177ea8"), 1))
         p.drawEllipse(50, 40, 110, 110)
         p.setPen(QPen(QColor("#43e4ff"), 3, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-        p.drawArc(34, 24, 142, 142, 25 * 16, 72 * 16)
-        p.drawArc(34, 24, 142, 142, 205 * 16, 72 * 16)
+        first_arc = self.phase * 16
+        second_arc = ((self.phase + 180) % 360) * 16
+        arc_length = (90 if self.speaking else 48) * 16
+        p.drawArc(34, 24, 142, 142, first_arc, arc_length)
+        p.drawArc(34, 24, 142, 142, second_arc, arc_length)
         p.setPen(QPen(QColor("#43e4ff"), 2))
         p.drawLine(105, 18, 105, 29)
         p.drawLine(105, 161, 105, 172)
@@ -849,6 +1097,7 @@ class Companion(QWidget):
         self.quit_after_speech = False
         self.waiting_for_wake_speech = False
         self.chrome_controller = None
+        self.command_target_hwnd = None
         self.pending_chrome_type = False
         self.pending_chrome_delete = False
         self.notes_window = None
@@ -872,10 +1121,16 @@ class Companion(QWidget):
                 font-size: 12px;
             }
         """)
+        self.bubble.setFixedWidth(230)
 
         self.art = CharacterArt()
         self.art.setToolTip("Drag to move. Right-click for options.")
         self.art.mousePressEvent = self.character_clicked
+        self.art.mouseMoveEvent = self.overlay_mouse_move
+        self.art.mouseReleaseEvent = self.overlay_mouse_release
+        self.bubble.mousePressEvent = self.overlay_mouse_press
+        self.bubble.mouseMoveEvent = self.overlay_mouse_move
+        self.bubble.mouseReleaseEvent = self.overlay_mouse_release
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
@@ -883,7 +1138,9 @@ class Companion(QWidget):
         layout.addWidget(self.bubble)
         layout.addWidget(self.art, alignment=Qt.AlignmentFlag.AlignCenter)
         self.setStyleSheet("background: transparent;")
-        self.setFixedSize(250, 330)
+        self.setFixedWidth(250)
+        self.setMinimumHeight(330)
+        self.adjustSize()
 
         screen = QApplication.primaryScreen().availableGeometry()
         self.move(screen.right() - self.width() - 30, screen.bottom() - self.height() - 35)
@@ -909,9 +1166,11 @@ class Companion(QWidget):
         self.hide()
 
     def on_wake_word(self):
+        if self.chrome_controller is None:
+            self.chrome_controller = ChromeController()
+        self.command_target_hwnd = self.chrome_controller.user32.GetForegroundWindow()
         self.show()
         self.raise_()
-        self.activateWindow()
         self.waiting_for_wake_speech = True
         self.greet()
 
@@ -1010,6 +1269,9 @@ class Companion(QWidget):
             return
 
         if self.handle_chrome_command(command, normalized):
+            return
+
+        if self.handle_windows_app_command(command, normalized):
             return
 
         if self.notes_active:
@@ -1184,17 +1446,19 @@ class Companion(QWidget):
                 controller.shortcut(controller.VK_ALT, controller.VK_RIGHT)
                 self.say("Going forward in Chrome.")
             elif normalized == "new tab":
-                controller.shortcut(controller.VK_CONTROL, ord("T"))
-                self.say("Opened a new Chrome tab.")
+                active_title = controller.foreground_title().lower()
+                new_tab_key = ord("N") if "notepad" in active_title else ord("T")
+                controller.shortcut_foreground(controller.VK_CONTROL, new_tab_key)
+                self.say("Opened a new tab in the active application.")
             elif normalized == "close tab":
-                controller.shortcut(controller.VK_CONTROL, ord("W"))
-                self.say("Closed the current Chrome tab.")
+                controller.shortcut_foreground(controller.VK_CONTROL, ord("W"))
+                self.say("Closed the current tab in the active application.")
             elif normalized == "scroll down":
-                controller.shortcut(controller.VK_NEXT)
-                self.say("Scrolling down the Chrome page.")
+                controller.shortcut_foreground(controller.VK_NEXT)
+                self.say("Scrolling down in the active application.")
             elif normalized == "scroll up":
-                controller.shortcut(controller.VK_PRIOR)
-                self.say("Scrolling up the Chrome page.")
+                controller.shortcut_foreground(controller.VK_PRIOR)
+                self.say("Scrolling up in the active application.")
             elif normalized in ("enter", "press enter", "submit"):
                 controller.shortcut(controller.VK_ENTER)
                 self.say("Submitted the focused Chrome field.")
@@ -1203,6 +1467,39 @@ class Companion(QWidget):
                 self.say("Deleted the previous word in the focused Chrome field.")
         except Exception as exc:
             self.say(f"I couldn't complete that Chrome command: {exc}")
+        return True
+
+    def handle_windows_app_command(self, command, normalized):
+        if normalized.strip(" .!?,") in (
+            "minimize", "minimize window", "minimize current app", "minimize current application",
+            "minimise", "minimise window", "minimise current app", "minimise current application",
+        ):
+            try:
+                WindowsAppController.minimize_foreground_app(self.command_target_hwnd)
+                self.say("Minimized the active application.")
+            except Exception as exc:
+                self.say(f"I couldn't minimize the active application: {exc}")
+            return True
+        match = re.match(r"^(open|launch|start|close|exit)\s+(.+?)\s*[.!?]*$", command.strip(), re.IGNORECASE)
+        if not match:
+            return False
+        action, target = match.groups()
+        target = target.strip()
+        target_normalized = WindowsAppController.normalize_name(target)
+        if target_normalized in ("astra", "assistant", "the assistant", "companion"):
+            return False
+        try:
+            if action.lower() in ("open", "launch", "start"):
+                app_name = WindowsAppController.open_app(target)
+                self.say(f"Opening {app_name}.")
+            else:
+                closed = WindowsAppController.close_app(target)
+                if closed:
+                    self.say(f"Closing {target}.")
+                else:
+                    self.say(f"I couldn't find an open window for {target}.")
+        except Exception as exc:
+            self.say(str(exc))
         return True
 
     def open_notepad(self):
@@ -1311,8 +1608,10 @@ class Companion(QWidget):
             self.say(f"I heard you say, {command}. I can help with the time, date, greetings, and desktop controls. What would you like to try?")
 
     def say(self, text):
-        self.bubble.setText(text)
-        self.bubble.repaint()
+        if self.speech_worker is None:
+            self.set_status(text)
+            self.bubble.repaint()
+        self.art.set_speaking(True)
         self.listener.pause()
         self.speech_queue.append(text)
         self.start_next_speech()
@@ -1322,23 +1621,35 @@ class Companion(QWidget):
             return
         text = self.speech_queue.pop(0)
         worker = SpeechWorker(text, self.edge_playback)
+        worker.speech_started.connect(self.on_speech_started)
         worker.finished.connect(self.on_speech_finished)
         self.speech_worker = worker
         worker.start()
 
+    def on_speech_started(self, text):
+        self.set_status(text)
+        self.art.set_speaking(True)
+        self.bubble.repaint()
+
     def on_speech_finished(self):
         worker = self.speech_worker
         self.speech_worker = None
+        self.art.set_speaking(False)
         if self.waiting_for_wake_speech:
             self.waiting_for_wake_speech = False
+            if self.command_target_hwnd:
+                self.chrome_controller.user32.SetForegroundWindow(self.command_target_hwnd)
             self.listener.wake_response_finished.set()
         if worker and not worker.success:
             self.set_status(f"Aria could not speak: {worker.error}")
             self.tray.showMessage("Aria voice unavailable", worker.error[:240])
+        elif worker:
+            self.set_status(worker.text)
         if self.speech_queue:
             self.start_next_speech()
         elif self.quit_after_speech:
             self.close()
+            QApplication.quit()
         else:
             self.listener.resume()
 
@@ -1367,6 +1678,35 @@ class Companion(QWidget):
             menu.addAction(top_action)
             menu.addAction(exit_action)
             menu.exec(event.globalPosition().toPoint())
+        elif event.button() == Qt.MouseButton.LeftButton:
+            self.begin_drag(event)
+
+    def overlay_mouse_press(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.begin_drag(event)
+
+    def begin_drag(self, event):
+        self.drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+        event.accept()
+
+    def move_overlay(self, event):
+        if self.drag_offset is None or not event.buttons() & Qt.MouseButton.LeftButton:
+            return
+        new_position = event.globalPosition().toPoint() - self.drag_offset
+        screen = QApplication.screenAt(event.globalPosition().toPoint()) or QApplication.primaryScreen()
+        bounds = screen.availableGeometry()
+        x = max(bounds.left(), min(new_position.x(), bounds.right() - self.width() + 1))
+        y = max(bounds.top(), min(new_position.y(), bounds.bottom() - self.height() + 1))
+        self.move(x, y)
+        event.accept()
+
+    def overlay_mouse_move(self, event):
+        self.move_overlay(event)
+
+    def overlay_mouse_release(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.drag_offset = None
+            event.accept()
 
     def toggle_topmost(self):
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint,
@@ -1379,9 +1719,7 @@ class Companion(QWidget):
             event.accept()
 
     def mouseMoveEvent(self, event):
-        if self.drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
-            self.move(event.globalPosition().toPoint() - self.drag_offset)
-            event.accept()
+        self.move_overlay(event)
 
     def mouseReleaseEvent(self, event):
         self.drag_offset = None
