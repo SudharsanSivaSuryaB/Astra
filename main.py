@@ -89,6 +89,106 @@ def remove_wake_word(text):
             return (text[:match.start()] + text[match.end():]).strip(" ,.!?")
     return text.strip(" ,.!?")
 
+
+class VoiceCommandSequenceParser:
+    """Split command sequences using registered command families, not command pairs."""
+    def __init__(self):
+        self._command_starters = []
+        self._separators = re.compile(r"\s*,?\s+(?:and\s+then|then|and)\s+", re.IGNORECASE)
+        # Keep the original connectors above and recognize common spoken
+        # transitions as additional ways to chain commands.
+        self._additional_separators = re.compile(
+            r"\s*,?\s+(?:and\s+(?:after\s+that|afterwards|afterward|next|finally|subsequently)|"
+            r"after\s+that|afterwards|afterward|next|also|followed\s+by|subsequently|finally|"
+            r"plus|but|or|so|yet)\s+",
+            re.IGNORECASE,
+        )
+
+    def register_command_starter(self, pattern):
+        """Register the start pattern for a voice-command family added to Astra."""
+        compiled = re.compile(pattern, re.IGNORECASE)
+        if compiled.pattern not in {item.pattern for item in self._command_starters}:
+            self._command_starters.append(compiled)
+
+    def is_command_start(self, text):
+        candidate = text.strip(" \t\r\n,.!?")
+        return any(pattern.match(candidate) for pattern in self._command_starters)
+
+    def split(self, command):
+        original = command.strip(" \t\r\n,.!?")
+        if not self.is_command_start(original):
+            return [original]
+
+        parts = []
+        part_start = 0
+        boundaries = []
+        for separator_pattern in (self._separators, self._additional_separators):
+            for separator in separator_pattern.finditer(command):
+                if self.is_command_start(command[separator.end():]):
+                    boundaries.append(separator.end())
+
+        # Voice often omits connectors between actions, as in
+        # "scroll down new tab" or "new tab type hello hit enter". Split when
+        # the text before a recognized starter is itself a complete command.
+        adjacent_candidates = sorted(
+            {match.start() for starter in self._command_starters for match in starter.finditer(command)}
+        )
+        scan_start = 0
+        for position in adjacent_candidates:
+            prior_separator = max((boundary for boundary in boundaries if boundary < position), default=0)
+            scan_start = max(scan_start, prior_separator)
+            if position <= scan_start or any(abs(position - boundary) < 2 for boundary in boundaries):
+                continue
+            prefix = command[scan_start:position].strip(" \t\r\n,.!?")
+            is_bare_action = re.fullmatch(
+                r"(?:open|launch|start|close|exit|type|search)\b", prefix, re.IGNORECASE
+            )
+            if self.is_command_start(prefix) and not is_bare_action:
+                boundaries.append(position)
+                scan_start = position
+        boundaries = sorted(set(boundaries))
+        for boundary in boundaries:
+            part = command[part_start:boundary].strip(" \t\r\n,.!?")
+            if self.is_command_start(part):
+                parts.append(part)
+                part_start = boundary
+
+        final_part = command[part_start:].strip(" \t\r\n,.!?")
+        if not parts:
+            return [original]
+        if final_part:
+            parts.append(final_part)
+        return parts
+
+
+VOICE_COMMAND_SEQUENCES = VoiceCommandSequenceParser()
+
+
+def register_voice_command_starter(pattern):
+    """Add a command family's opening pattern to compound-command parsing.
+
+    Call this when adding a new command handler so it can be chained with
+    existing commands using "and" or "then" without editing the parser.
+    """
+    VOICE_COMMAND_SEQUENCES.register_command_starter(pattern)
+
+
+for _starter_pattern in (
+    r"(?:open|launch|start|close)\b",
+    r"exit\s+(?:chrome|notepad|notes)\b",
+    r"(?:take|start|stop|exit|save)\s+notes\b",
+    r"(?:type|search|reload|go\s+back|go\s+forward|new\s+tab|close\s+tab|"
+    r"(?:switch\s+to\s+)?(?:next|previous|prev)\s+tab|"
+    r"scroll\s+(?:up|down)|(?:hit|press)\s+enter|enter|delete)\b",
+    r"(?:minimi[sz]e|maximi[sz]e|hide|show)\b",
+    r"(?:what\s+time|tell\s+me\s+the\s+time|goodbye)\b",
+):
+    register_voice_command_starter(_starter_pattern)
+
+
+def split_compound_commands(command):
+    return VOICE_COMMAND_SEQUENCES.split(command)
+
 try:
     import pyttsx3
 except ImportError:
@@ -473,6 +573,8 @@ class ChromeController:
     KEYEVENTF_KEYUP = 0x0002
     INPUT_KEYBOARD = 1
     VK_CONTROL = 0x11
+    VK_SHIFT = 0x10
+    VK_TAB = 0x09
     VK_R = 0x52
     VK_LEFT = 0x25
     VK_RIGHT = 0x27
@@ -614,13 +716,19 @@ class ChromeController:
         if pyperclip is None:
             raise RuntimeError("Typing into Chrome needs the clipboard helper. Run run_windows.bat to install requirements.")
         self.focus()
+        self.type_text_foreground(text)
+
+    def type_text_foreground(self, text):
+        """Paste into the currently focused application without switching to Chrome."""
+        if pyperclip is None:
+            raise RuntimeError("Typing needs the clipboard helper. Run run_windows.bat to install requirements.")
         try:
             previous_clipboard = pyperclip.paste()
         except Exception:
             previous_clipboard = None
         pyperclip.copy(text)
         try:
-            self.shortcut(self.VK_CONTROL, ord("V"))
+            self._send_key_chord(self.VK_CONTROL, ord("V"))
             time.sleep(0.15)
         finally:
             if previous_clipboard is not None:
@@ -647,7 +755,71 @@ class WindowsAppController:
     """Resolve common Windows apps and Start Menu shortcuts by spoken name."""
     WM_CLOSE = 0x0010
     SW_MINIMIZE = 6
+    SW_MAXIMIZE = 3
+    SW_RESTORE = 9
     PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+    BROWSER_EXECUTABLES = {
+        "chrome": ("chrome.exe", "chrome"),
+        "edge": ("msedge.exe", "msedge"),
+        "brave": ("brave.exe", "brave"),
+        "firefox": ("firefox.exe", "firefox"),
+        "opera": ("opera.exe", "opera"),
+    }
+    NATIVE_DESTINATIONS = {
+        "recycle_bin": ("shell", "RecycleBinFolder", "Recycle Bin"),
+        "control_panel": ("shell", "ControlPanelFolder", "Control Panel"),
+        "this_pc": ("shell", "MyComputerFolder", "This PC"),
+        "downloads": ("shell", "Downloads", "Downloads"),
+        "documents": ("shell", "Personal", "Documents"),
+        "pictures": ("shell", "My Pictures", "Pictures"),
+        "music": ("shell", "My Music", "Music"),
+        "videos": ("shell", "My Video", "Videos"),
+        "task_manager": ("exe", "taskmgr.exe", "Task Manager"),
+        "calculator": ("exe", "calc.exe", "Calculator"),
+        "paint": ("exe", "mspaint.exe", "Paint"),
+        "snipping_tool": ("exe", "snippingtool.exe", "Snipping Tool"),
+    }
+    APP_NAME_ALIASES = {
+        "vs": "visual studio",
+        "visual studio": "visual studio",
+        "vs code": "visual studio code",
+        "vscode": "visual studio code",
+        "vsc": "visual studio code",
+        "v s code": "visual studio code",
+        "v s c": "visual studio code",
+        "visual studio code": "visual studio code",
+        "ms word": "word",
+        "microsoft word": "word",
+        "winword": "word",
+        "ms excel": "excel",
+        "microsoft excel": "excel",
+        "ms powerpoint": "powerpoint",
+        "ms ppt": "powerpoint",
+        "ms power point": "powerpoint",
+        "microsoft powerpoint": "powerpoint",
+        "power point": "powerpoint",
+        "ppt": "powerpoint",
+        "ms outlook": "outlook",
+        "microsoft outlook": "outlook",
+        "ms onenote": "onenote",
+        "microsoft onenote": "onenote",
+        "ms teams": "teams",
+        "microsoft teams": "teams",
+        "vlc": "vlc media player",
+        "obs": "obs studio",
+    }
+    APP_EXECUTABLES = {
+        "visual studio": ("devenv.exe", "devenv"),
+        "visual studio code": ("code.exe", "code"),
+        "word": ("winword.exe", "winword"),
+        "excel": ("excel.exe", "excel"),
+        "powerpoint": ("powerpnt.exe", "powerpnt"),
+        "outlook": ("outlook.exe", "outlook"),
+        "onenote": ("onenote.exe", "onenote"),
+        "vlc media player": ("vlc.exe", "vlc"),
+        "obs studio": ("obs64.exe", "obs32.exe", "obs"),
+    }
 
     @staticmethod
     def normalize_name(value):
@@ -658,6 +830,22 @@ class WindowsAppController:
         normalized = cls.normalize_name(target)
         if normalized in ("files", "file", "file explorer", "explorer", "windows explorer"):
             return "explorer"
+        native_aliases = {
+            "recycle bin": "recycle_bin", "recyclebin": "recycle_bin", "trash": "recycle_bin",
+            "control panel": "control_panel", "this pc": "this_pc", "my computer": "this_pc",
+            "computer": "this_pc", "downloads folder": "downloads", "download folder": "downloads",
+            "documents folder": "documents", "my documents": "documents",
+            "pictures folder": "pictures", "my pictures": "pictures",
+            "music folder": "music", "my music": "music", "videos folder": "videos",
+            "video folder": "videos", "my videos": "videos",
+            "task manager": "task_manager", "taskmgr": "task_manager",
+            "calculator": "calculator", "calc": "calculator", "paint": "paint",
+            "snipping tool": "snipping_tool", "snippingtool": "snipping_tool",
+        }
+        if normalized in native_aliases:
+            return native_aliases[normalized]
+        if normalized in cls.APP_NAME_ALIASES:
+            return cls.APP_NAME_ALIASES[normalized]
         if normalized in (
             "edge", "microsoft edge", "ed", "age", "eddge", "ed age",
             "microsoft ed", "microsoft age", "microsoft eddge", "microsoft ed age",
@@ -667,7 +855,46 @@ class WindowsAppController:
             return "store"
         if normalized in ("settings", "windows settings", "system settings", "computer settings"):
             return "settings"
+        if normalized in ("google chrome",):
+            return "chrome"
         return normalized
+
+    @classmethod
+    def browser_name(cls, target):
+        alias = cls.aliases(target)
+        return alias if alias in cls.BROWSER_EXECUTABLES else None
+
+    @classmethod
+    def browser_executable_path(cls, browser):
+        browser = cls.browser_name(browser) or browser
+        if browser not in cls.BROWSER_EXECUTABLES:
+            return None
+        for executable_name in cls.BROWSER_EXECUTABLES[browser]:
+            executable = shutil.which(executable_name)
+            if executable:
+                return executable
+        roots = (os.environ.get("PROGRAMFILES"), os.environ.get("PROGRAMFILES(X86)"),
+                 os.environ.get("LOCALAPPDATA"))
+        install_paths = {
+            "chrome": ("Google", "Chrome", "Application", "chrome.exe"),
+            "edge": ("Microsoft", "Edge", "Application", "msedge.exe"),
+            "brave": ("BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+            "firefox": ("Mozilla Firefox", "firefox.exe"),
+            "opera": ("Programs", "Opera", "opera.exe"),
+        }
+        for root in roots:
+            if root:
+                candidate = os.path.join(root, *install_paths[browser])
+                if os.path.isfile(candidate):
+                    return candidate
+        return None
+
+    @classmethod
+    def open_url_in_browser(cls, browser, url):
+        executable = cls.browser_executable_path(browser)
+        if not executable:
+            raise RuntimeError(f"{browser.title()} wasn't found. Install it, then try again.")
+        subprocess.Popen([executable, url], close_fds=True)
 
     @staticmethod
     def start_menu_roots():
@@ -695,22 +922,57 @@ class WindowsAppController:
         return None
 
     @classmethod
+    def find_registered_app_executable(cls, target):
+        """Resolve an installed Windows app registered through App Paths."""
+        if os.name != "nt":
+            return None
+        try:
+            import winreg
+        except ImportError:
+            return None
+        executable_name = target if target.lower().endswith(".exe") else f"{target}.exe"
+        key_path = rf"Software\Microsoft\Windows\CurrentVersion\App Paths\{executable_name}"
+        roots = (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE)
+        for root in roots:
+            try:
+                with winreg.OpenKey(root, key_path) as app_key:
+                    executable, _ = winreg.QueryValueEx(app_key, None)
+                executable = os.path.expandvars(executable.strip('"'))
+                if os.path.isfile(executable):
+                    return executable
+            except OSError:
+                continue
+        return None
+
+    @classmethod
     def open_app(cls, target):
         if os.name != "nt":
             raise RuntimeError("Dynamic app commands are supported on Windows only.")
         alias = cls.aliases(target)
+        browser = cls.browser_name(target)
+        if browser:
+            executable = cls.browser_executable_path(browser)
+            if executable:
+                subprocess.Popen([executable], close_fds=True)
+                return {"chrome": "Google Chrome", "edge": "Microsoft Edge",
+                        "brave": "Brave", "firefox": "Firefox", "opera": "Opera"}[browser]
+            raise RuntimeError(f"{browser.title()} wasn't found. Install it, then try again.")
+        native_target = cls.NATIVE_DESTINATIONS.get(alias)
+        if native_target:
+            destination_type, destination, app_name = native_target
+            if destination_type == "shell":
+                subprocess.Popen(["explorer.exe", f"shell:{destination}"], close_fds=True)
+            else:
+                executable = shutil.which(destination) or cls.find_registered_app_executable(destination)
+                if not executable:
+                    raise RuntimeError(f"{app_name} wasn't found on this computer.")
+                subprocess.Popen([executable], close_fds=True)
+            return app_name
         if alias == "explorer":
             subprocess.Popen(["explorer.exe"], close_fds=True)
             return "File Explorer"
         if alias == "edge":
-            executable = shutil.which("msedge.exe") or shutil.which("msedge")
-            if not executable:
-                for root in (os.environ.get("PROGRAMFILES(X86)"), os.environ.get("PROGRAMFILES")):
-                    if root:
-                        candidate = os.path.join(root, "Microsoft", "Edge", "Application", "msedge.exe")
-                        if os.path.isfile(candidate):
-                            executable = candidate
-                            break
+            executable = cls.edge_executable_path()
             if executable:
                 subprocess.Popen([executable], close_fds=True)
                 return "Microsoft Edge"
@@ -721,14 +983,22 @@ class WindowsAppController:
             os.startfile("ms-settings:")
             return "Windows Settings"
 
-        shortcut = cls.find_start_menu_shortcut(target)
+        lookup_name = alias or target
+        shortcut = cls.find_start_menu_shortcut(lookup_name)
         if shortcut:
             os.startfile(shortcut)
             return os.path.splitext(os.path.basename(shortcut))[0]
-        executable = shutil.which(target)
+        executable = None
+        executable_names = cls.APP_EXECUTABLES.get(lookup_name, (lookup_name, target))
+        for executable_name in executable_names:
+            executable = shutil.which(executable_name)
+            if not executable:
+                executable = cls.find_registered_app_executable(executable_name)
+            if executable:
+                break
         if executable:
             subprocess.Popen([executable], close_fds=True)
-            return target
+            return lookup_name.title()
         raise RuntimeError(f"I couldn't find an installed app or Start Menu shortcut named {target}.")
 
     @classmethod
@@ -752,6 +1022,56 @@ class WindowsAppController:
             return ""
         finally:
             kernel32.CloseHandle(handle)
+
+    @classmethod
+    def foreground_browser(cls, fallback_hwnd=None):
+        """Return the browser owning the foreground window, when recognized."""
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        user32.GetWindowTextLengthW.argtypes = (wintypes.HWND,)
+        user32.GetWindowTextLengthW.restype = ctypes.c_int
+        user32.GetWindowTextW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+        user32.GetWindowThreadProcessId.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+
+        hwnd = user32.GetForegroundWindow()
+        if hwnd:
+            title_length = user32.GetWindowTextLengthW(hwnd)
+            title = ctypes.create_unicode_buffer(title_length + 1)
+            user32.GetWindowTextW(hwnd, title, len(title))
+            if "desktop ai assistant" in title.value.lower() and fallback_hwnd:
+                hwnd = fallback_hwnd
+        if not hwnd:
+            hwnd = fallback_hwnd
+        if not hwnd:
+            return None
+
+        process_id = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
+        image_name = os.path.basename(cls._process_image(process_id.value)).lower()
+        for browser, executable_names in cls.BROWSER_EXECUTABLES.items():
+            if image_name in executable_names:
+                return browser
+        return None
+
+    @classmethod
+    def edge_executable_path(cls):
+        executable = shutil.which("msedge.exe") or shutil.which("msedge")
+        if executable:
+            return executable
+        for root in (os.environ.get("PROGRAMFILES(X86)"), os.environ.get("PROGRAMFILES")):
+            if root:
+                candidate = os.path.join(root, "Microsoft", "Edge", "Application", "msedge.exe")
+                if os.path.isfile(candidate):
+                    return candidate
+        return None
+
+    @classmethod
+    def open_url_in_edge(cls, url):
+        executable = cls.edge_executable_path()
+        if not executable:
+            raise RuntimeError("Microsoft Edge wasn't found. Install Edge, then try again.")
+        subprocess.Popen([executable, url], close_fds=True)
 
     @classmethod
     def close_app(cls, target):
@@ -832,6 +1152,186 @@ class WindowsAppController:
             raise RuntimeError("I couldn't find an active application window to minimize.")
         user32.ShowWindow(hwnd, cls.SW_MINIMIZE)
         return True
+
+    @classmethod
+    def maximize_app(cls, target):
+        """Maximize a matching open app window and report its previous state."""
+        if os.name != "nt":
+            raise RuntimeError("Window commands are supported on Windows only.")
+        alias = cls.aliases(target)
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.EnumWindows.argtypes = (
+            ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM),
+            wintypes.LPARAM,
+        )
+        user32.EnumWindows.restype = wintypes.BOOL
+        user32.IsWindowVisible.argtypes = (wintypes.HWND,)
+        user32.IsWindowVisible.restype = wintypes.BOOL
+        user32.GetWindowTextLengthW.argtypes = (wintypes.HWND,)
+        user32.GetWindowTextW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+        user32.GetWindowThreadProcessId.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        user32.GetClassNameW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+        user32.IsIconic.argtypes = (wintypes.HWND,)
+        user32.IsIconic.restype = wintypes.BOOL
+        user32.IsZoomed.argtypes = (wintypes.HWND,)
+        user32.IsZoomed.restype = wintypes.BOOL
+        user32.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
+        user32.BringWindowToTop.argtypes = (wintypes.HWND,)
+        user32.SetForegroundWindow.argtypes = (wintypes.HWND,)
+
+        matches = []
+        callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def visit(hwnd, _):
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            title_buffer = ctypes.create_unicode_buffer(user32.GetWindowTextLengthW(hwnd) + 1)
+            user32.GetWindowTextW(hwnd, title_buffer, len(title_buffer))
+            class_buffer = ctypes.create_unicode_buffer(128)
+            user32.GetClassNameW(hwnd, class_buffer, len(class_buffer))
+            process_id = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
+            image_name = os.path.basename(cls._process_image(process_id.value)).lower()
+            if alias == "explorer":
+                matched = class_buffer.value.lower() in ("cabinetwclass", "explorewclass")
+            elif alias == "edge":
+                matched = image_name == "msedge.exe"
+            elif alias == "store":
+                title = cls.normalize_name(title_buffer.value)
+                matched = "microsoft store" in title or "windows store" in title
+            else:
+                matched = (alias in cls.normalize_name(title_buffer.value) or
+                           alias in cls.normalize_name(image_name.removesuffix(".exe")))
+            if matched:
+                matches.append(hwnd)
+            return True
+
+        callback = callback_type(visit)
+        user32.EnumWindows(callback, 0)
+        if not matches:
+            return None
+
+        hwnd = matches[0]
+        if user32.IsZoomed(hwnd):
+            return "already_maximized"
+        was_minimized = bool(user32.IsIconic(hwnd))
+        if was_minimized:
+            user32.ShowWindow(hwnd, cls.SW_RESTORE)
+        user32.ShowWindow(hwnd, cls.SW_MAXIMIZE)
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+        return "maximized_from_minimized" if was_minimized else "maximized"
+
+    @classmethod
+    def minimize_app(cls, target):
+        """Minimize a matching open app window, or report its current state."""
+        if os.name != "nt":
+            raise RuntimeError("Window commands are supported on Windows only.")
+        alias = cls.aliases(target)
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.EnumWindows.argtypes = (
+            ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM),
+            wintypes.LPARAM,
+        )
+        user32.EnumWindows.restype = wintypes.BOOL
+        user32.IsWindowVisible.argtypes = (wintypes.HWND,)
+        user32.IsWindowVisible.restype = wintypes.BOOL
+        user32.GetWindowTextLengthW.argtypes = (wintypes.HWND,)
+        user32.GetWindowTextW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+        user32.GetWindowThreadProcessId.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        user32.GetClassNameW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+        user32.IsIconic.argtypes = (wintypes.HWND,)
+        user32.IsIconic.restype = wintypes.BOOL
+        user32.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
+
+        matches = []
+        callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def visit(hwnd, _):
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            title_buffer = ctypes.create_unicode_buffer(user32.GetWindowTextLengthW(hwnd) + 1)
+            user32.GetWindowTextW(hwnd, title_buffer, len(title_buffer))
+            class_buffer = ctypes.create_unicode_buffer(128)
+            user32.GetClassNameW(hwnd, class_buffer, len(class_buffer))
+            process_id = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
+            image_name = os.path.basename(cls._process_image(process_id.value)).lower()
+            if alias == "explorer":
+                matched = class_buffer.value.lower() in ("cabinetwclass", "explorewclass")
+            elif alias == "edge":
+                matched = image_name == "msedge.exe"
+            elif alias == "store":
+                title = cls.normalize_name(title_buffer.value)
+                matched = "microsoft store" in title or "windows store" in title
+            else:
+                matched = (alias in cls.normalize_name(title_buffer.value) or
+                           alias in cls.normalize_name(image_name.removesuffix(".exe")))
+            if matched:
+                matches.append(hwnd)
+            return True
+
+        callback = callback_type(visit)
+        user32.EnumWindows(callback, 0)
+        if not matches:
+            return None
+
+        hwnd = matches[0]
+        if user32.IsIconic(hwnd):
+            return "already_minimized"
+        user32.ShowWindow(hwnd, cls.SW_MINIMIZE)
+        return "minimized"
+
+    @classmethod
+    def minimize_all_apps(cls):
+        """Minimize visible application windows while keeping Astra available."""
+        if os.name != "nt":
+            raise RuntimeError("Window commands are supported on Windows only.")
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.EnumWindows.argtypes = (
+            ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM),
+            wintypes.LPARAM,
+        )
+        user32.EnumWindows.restype = wintypes.BOOL
+        user32.IsWindowVisible.argtypes = (wintypes.HWND,)
+        user32.IsWindowVisible.restype = wintypes.BOOL
+        user32.GetWindowTextLengthW.argtypes = (wintypes.HWND,)
+        user32.GetWindowTextW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+        user32.GetClassNameW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+        user32.IsIconic.argtypes = (wintypes.HWND,)
+        user32.IsIconic.restype = wintypes.BOOL
+        user32.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
+
+        counts = {"minimized": 0, "already_minimized": 0}
+        excluded_classes = {"progman", "workerw", "shell_traywnd", "dv2controlhost"}
+        callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def visit(hwnd, _):
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            title_length = user32.GetWindowTextLengthW(hwnd)
+            if title_length == 0:
+                return True
+            title_buffer = ctypes.create_unicode_buffer(title_length + 1)
+            user32.GetWindowTextW(hwnd, title_buffer, len(title_buffer))
+            if "desktop ai assistant" in title_buffer.value.lower():
+                return True
+            class_buffer = ctypes.create_unicode_buffer(128)
+            user32.GetClassNameW(hwnd, class_buffer, len(class_buffer))
+            if class_buffer.value.lower() in excluded_classes:
+                return True
+            if user32.IsIconic(hwnd):
+                counts["already_minimized"] += 1
+            else:
+                user32.ShowWindow(hwnd, cls.SW_MINIMIZE)
+                counts["minimized"] += 1
+            return True
+
+        callback = callback_type(visit)
+        user32.EnumWindows(callback, 0)
+        return counts
 
 
 class VoiceListener(QThread):
@@ -1097,6 +1597,8 @@ class Companion(QWidget):
         self.quit_after_speech = False
         self.waiting_for_wake_speech = False
         self.chrome_controller = None
+        self.last_opened_browser = None
+        self.last_typed_text = ""
         self.command_target_hwnd = None
         self.pending_chrome_type = False
         self.pending_chrome_delete = False
@@ -1237,7 +1739,8 @@ class Companion(QWidget):
             try:
                 if self.chrome_controller is None:
                     self.chrome_controller = ChromeController()
-                self.chrome_controller.type_text(command.strip())
+                self.chrome_controller.type_text_foreground(command.strip())
+                self.last_typed_text = command.strip()
                 self.say("Typed into the focused field.")
             except Exception as exc:
                 self.say(f"I couldn't type into the focused field: {exc}")
@@ -1259,6 +1762,17 @@ class Companion(QWidget):
             except Exception as exc:
                 self.say(f"I couldn't delete those words in Chrome: {exc}")
             return
+
+        if not self.notes_active:
+            command_parts = split_compound_commands(command)
+            if len(command_parts) > 1:
+                for part_index, command_part in enumerate(command_parts):
+                    self.handle_voice_command(command_part)
+                    if (part_index + 1 < len(command_parts) and
+                            re.match(r"^(?:open|launch|start|new\s+tab)\b", command_part, re.IGNORECASE) and
+                            re.match(r"^type\b", command_parts[part_index + 1], re.IGNORECASE)):
+                        time.sleep(0.8)
+                return
 
         if "save notes" in normalized or "save note" in normalized:
             self.save_notes()
@@ -1375,16 +1889,22 @@ class Companion(QWidget):
     def handle_chrome_command(self, command, normalized):
         normalized = normalized.strip(" .!?,")
         search_match = re.match(r"^search(?:\s+for)?\s+(.+?)\s*$", command.strip(), re.IGNORECASE)
+        search_in_browser_match = re.match(
+            r"^search\s+in\s+(chrome|google\s+chrome|edge|microsoft\s+edge|brave|firefox|opera)\s+for\s+(.+?)\s*$",
+            command.strip(), re.IGNORECASE,
+        )
         type_match = re.match(r"^type(?:\s+(.+))?$", command.strip(), re.IGNORECASE)
         delete_match = re.match(r"^delete\s+last\s+(.+?)\s+words?$", normalized)
         if normalized == "search":
             self.say("What would you like me to search for?")
             return True
-        if not (normalized == "open chrome" or search_match or type_match or delete_match or
+        if not (normalized == "open chrome" or search_match or search_in_browser_match or type_match or delete_match or
                 normalized in ("delete", "delete word") or
                 normalized in ("reload", "reload tab", "go back", "go forward", "exit chrome",
-                               "new tab", "close tab", "scroll down", "scroll up",
-                               "enter", "press enter", "submit", "delete", "delete word")):
+                               "new tab", "close tab", "next tab", "previous tab", "prev tab",
+                               "switch to next tab", "switch to previous tab", "switch to prev tab",
+                               "scroll down", "scroll up",
+                               "enter", "press enter", "hit enter", "submit", "delete", "delete word")):
             return False
 
         if normalized == "exit chrome":
@@ -1405,12 +1925,12 @@ class Companion(QWidget):
             if type_match:
                 text = (type_match.group(1) or "").strip()
                 if text:
-                    controller.type_text(text)
+                    controller.type_text_foreground(text)
+                    self.last_typed_text = text
                     self.say("Typed into the focused field.")
                 else:
-                    controller.focus()
                     self.pending_chrome_type = True
-                    self.say("What should I type? Focus the Chrome text field first, then dictate the words. Say ‘cancel’ to stop.")
+                    self.say("What should I type? Focus a text field in the active app, then dictate the words. Say ‘cancel’ to stop.")
             elif normalized == "delete":
                 controller.focus()
                 self.pending_chrome_delete = True
@@ -1427,15 +1947,36 @@ class Companion(QWidget):
                     self.say(f"Deleted the last {count} word{'s' if count != 1 else ''} from the focused Chrome field.")
             elif normalized == "open chrome":
                 controller.open()
+                self.last_opened_browser = "chrome"
                 self.say("Opening Chrome.")
-            elif search_match:
-                query = search_match.group(1).strip()
+            elif search_match or search_in_browser_match:
+                explicit_browser = None
+                if search_in_browser_match:
+                    explicit_browser = WindowsAppController.browser_name(search_in_browser_match.group(1))
+                    query = search_in_browser_match.group(2).strip()
+                else:
+                    query = search_match.group(1).strip()
+                    suffix_match = re.match(
+                        r"^(.+?)\s+in\s+(chrome|google\s+chrome|edge|microsoft\s+edge|brave|firefox|opera)$",
+                        query, re.IGNORECASE,
+                    )
+                    if suffix_match:
+                        query = suffix_match.group(1).strip()
+                        explicit_browser = WindowsAppController.browser_name(suffix_match.group(2))
+                if query.lower().strip(" .!?,") in ("it", "that", "this") and self.last_typed_text:
+                    query = self.last_typed_text
                 if not query:
                     self.say("What would you like me to search for?")
                 else:
                     search_url = "https://www.google.com/search?q=" + urllib.parse.quote_plus(query)
-                    controller.open(search_url)
-                    self.say(f"Searching Chrome for {query}.")
+                    browser = (explicit_browser or
+                               WindowsAppController.foreground_browser(self.command_target_hwnd) or
+                               self.last_opened_browser or "chrome")
+                    WindowsAppController.open_url_in_browser(browser, search_url)
+                    self.last_opened_browser = browser
+                    browser_label = {"chrome": "Chrome", "edge": "Microsoft Edge", "brave": "Brave",
+                                     "firefox": "Firefox", "opera": "Opera"}.get(browser, browser.title())
+                    self.say(f"Searching in {browser_label} for {query}.")
             elif normalized in ("reload", "reload tab"):
                 controller.shortcut(controller.VK_CONTROL, controller.VK_R)
                 self.say("Reloading the Chrome tab.")
@@ -1453,13 +1994,21 @@ class Companion(QWidget):
             elif normalized == "close tab":
                 controller.shortcut_foreground(controller.VK_CONTROL, ord("W"))
                 self.say("Closed the current tab in the active application.")
+            elif normalized in ("next tab", "switch to next tab"):
+                controller.shortcut_foreground(controller.VK_CONTROL, controller.VK_TAB)
+                self.say("Switched to the next tab.")
+            elif normalized in ("previous tab", "prev tab", "switch to previous tab", "switch to prev tab"):
+                controller.shortcut_foreground(
+                    controller.VK_CONTROL, controller.VK_SHIFT, controller.VK_TAB
+                )
+                self.say("Switched to the previous tab.")
             elif normalized == "scroll down":
                 controller.shortcut_foreground(controller.VK_NEXT)
                 self.say("Scrolling down in the active application.")
             elif normalized == "scroll up":
                 controller.shortcut_foreground(controller.VK_PRIOR)
                 self.say("Scrolling up in the active application.")
-            elif normalized in ("enter", "press enter", "submit"):
+            elif normalized in ("enter", "press enter", "hit enter", "submit"):
                 controller.shortcut(controller.VK_ENTER)
                 self.say("Submitted the focused Chrome field.")
             elif normalized in ("delete", "delete word"):
@@ -1470,6 +2019,63 @@ class Companion(QWidget):
         return True
 
     def handle_windows_app_command(self, command, normalized):
+        if re.fullmatch(
+            r"minimi[sz]e\s+all(?:\s+the)?(?:\s+(?:(?:open|opened)\s+)?applications?)?"
+            r"(?:\s+are\s+(?:open|opened))?",
+            normalized.strip(" .!?"),
+        ):
+            try:
+                counts = WindowsAppController.minimize_all_apps()
+                if counts["minimized"]:
+                    self.say("Minimized all open applications.")
+                elif counts["already_minimized"]:
+                    self.say("All open applications are already minimized.")
+                else:
+                    self.say("There are no open applications to minimize.")
+            except Exception as exc:
+                self.say(f"I couldn't minimize all applications: {exc}")
+            return True
+
+        minimize_match = re.match(
+            r"^minimi[sz]e\s+(.+?)\s*[.!?]*$", command.strip(), re.IGNORECASE
+        )
+        if minimize_match:
+            target = minimize_match.group(1).strip()
+            target_normalized = WindowsAppController.normalize_name(target)
+            if target_normalized in ("astra", "assistant", "the assistant", "companion"):
+                return False
+            try:
+                result = WindowsAppController.minimize_app(target)
+                if result is None:
+                    self.say(f"{target} is not opened.")
+                elif result == "already_minimized":
+                    self.say(f"{target} is already minimized.")
+                else:
+                    self.say(f"Minimized {target}.")
+            except Exception as exc:
+                self.say(f"I couldn't minimize {target}: {exc}")
+            return True
+
+        maximize_match = re.match(
+            r"^maximi[sz]e\s+(.+?)\s*[.!?]*$", command.strip(), re.IGNORECASE
+        )
+        if maximize_match:
+            target = maximize_match.group(1).strip()
+            target_normalized = WindowsAppController.normalize_name(target)
+            if target_normalized in ("astra", "assistant", "the assistant", "companion"):
+                return False
+            try:
+                result = WindowsAppController.maximize_app(target)
+                if result is None:
+                    self.say(f"{target} is not opened.")
+                elif result == "already_maximized":
+                    self.say(f"{target} is already maximized.")
+                else:
+                    self.say(f"Maximized {target}.")
+            except Exception as exc:
+                self.say(f"I couldn't maximize {target}: {exc}")
+            return True
+
         if normalized.strip(" .!?,") in (
             "minimize", "minimize window", "minimize current app", "minimize current application",
             "minimise", "minimise window", "minimise current app", "minimise current application",
@@ -1491,6 +2097,9 @@ class Companion(QWidget):
         try:
             if action.lower() in ("open", "launch", "start"):
                 app_name = WindowsAppController.open_app(target)
+                browser = WindowsAppController.browser_name(app_name)
+                if browser:
+                    self.last_opened_browser = browser
                 self.say(f"Opening {app_name}.")
             else:
                 closed = WindowsAppController.close_app(target)
