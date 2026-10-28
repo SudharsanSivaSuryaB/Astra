@@ -122,14 +122,27 @@ class VoiceCommandSequenceParser:
         parts = []
         part_start = 0
         boundaries = []
-        for separator_pattern in (self._separators, self._additional_separators):
-            for separator in separator_pattern.finditer(command):
-                if self.is_command_start(command[separator.end():]):
-                    boundaries.append(separator.end())
+        separator_matches = sorted(
+            (match for pattern in (self._separators, self._additional_separators)
+             for match in pattern.finditer(command)),
+            key=lambda match: match.start(),
+        )
+        for separator in separator_matches:
+            current_start = max(
+                (boundary for boundary in boundaries if boundary < separator.start()), default=0
+            )
+            current_segment = command[current_start:separator.start()].strip(" \t\r\n,.!?")
+            # Once a type command starts, treat its full remainder as dictated
+            # text, even when it contains words that are also commands.
+            if re.match(r"^type\b", current_segment, re.IGNORECASE):
+                continue
+            if self.is_command_start(command[separator.end():]):
+                boundaries.append(separator.end())
 
         # Voice often omits connectors between actions, as in
-        # "scroll down new tab" or "new tab type hello hit enter". Split when
-        # the text before a recognized starter is itself a complete command.
+        # "scroll down new tab". Split when the text before a recognized
+        # starter is itself a complete command; a type command consumes its
+        # remaining text literally.
         adjacent_candidates = sorted(
             {match.start() for starter in self._command_starters for match in starter.finditer(command)}
         )
@@ -140,12 +153,23 @@ class VoiceCommandSequenceParser:
             if position <= scan_start or any(abs(position - boundary) < 2 for boundary in boundaries):
                 continue
             prefix = command[scan_start:position].strip(" \t\r\n,.!?")
+            if re.match(r"^type\b", command[scan_start:].lstrip(), re.IGNORECASE):
+                continue
             is_bare_action = re.fullmatch(
-                r"(?:open|launch|start|close|exit|type|search)\b", prefix, re.IGNORECASE
+                r"(?:open|launch|start|close|exit|type|search(?:\s+for)?)\b", prefix, re.IGNORECASE
             )
             if self.is_command_start(prefix) and not is_bare_action:
                 boundaries.append(position)
                 scan_start = position
+        type_boundaries = [
+            boundary for boundary in boundaries
+            if re.match(r"^type\b", command[boundary:].lstrip(), re.IGNORECASE)
+        ]
+        if re.match(r"^type\b", original, re.IGNORECASE):
+            type_boundaries.append(0)
+        if type_boundaries:
+            type_start = min(type_boundaries)
+            boundaries = [boundary for boundary in boundaries if boundary <= type_start]
         boundaries = sorted(set(boundaries))
         for boundary in boundaries:
             part = command[part_start:boundary].strip(" \t\r\n,.!?")
@@ -179,7 +203,8 @@ for _starter_pattern in (
     r"(?:take|start|stop|exit|save)\s+notes\b",
     r"(?:type|search|reload|go\s+back|go\s+forward|new\s+tab|close\s+tab|"
     r"(?:switch\s+to\s+)?(?:next|previous|prev)\s+tab|"
-    r"scroll\s+(?:up|down)|(?:hit|press)\s+enter|enter|delete)\b",
+    r"scroll\s+(?:up|down)|(?:hit|press)\s+enter|enter|delete|"
+    r"select\s+all|select\s+everything|copy|cut|paste|pay\s*st|undo|redo)\b",
     r"(?:minimi[sz]e|maximi[sz]e|hide|show)\b",
     r"(?:what\s+time|tell\s+me\s+the\s+time|goodbye)\b",
 ):
@@ -364,13 +389,15 @@ class NotesWindow:
         self.user32.PostMessageW.argtypes = (
             wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
         )
-        self.process = subprocess.Popen(["notepad.exe"])
-        self.hwnd = None
-        for _ in range(60):
-            self.hwnd = self._find_window()
-            if self.hwnd:
-                break
-            time.sleep(0.1)
+        self.process = None
+        self.hwnd = self._find_window()
+        if not self.hwnd:
+            self.process = subprocess.Popen(["notepad.exe"])
+            for _ in range(60):
+                self.hwnd = self._find_window()
+                if self.hwnd:
+                    break
+                time.sleep(0.1)
         if not self.hwnd:
             raise RuntimeError("Could not find the Notepad window.")
         self.focus()
@@ -387,11 +414,15 @@ class NotesWindow:
                 return True
             title = ctypes.create_unicode_buffer(title_length + 1)
             self.user32.GetWindowTextW(hwnd, title, len(title))
-            if "notepad" not in title.value.lower():
-                return True
             process_id = wintypes.DWORD()
             self.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
-            if process_id.value == self.process.pid:
+            is_notepad = "notepad" in title.value.lower()
+            if not is_notepad:
+                image_path = WindowsAppController._process_image(process_id.value)
+                is_notepad = os.path.basename(image_path).lower() == "notepad.exe"
+            if not is_notepad:
+                return True
+            if self.process and process_id.value == self.process.pid:
                 found["hwnd"] = hwnd
                 return False
             if found["fallback"] is None:
@@ -558,7 +589,11 @@ class NotesWindow:
         self._send_keyboard_events(((self.VK_ESCAPE, 0), (self.VK_ESCAPE, 0x0002)))
 
     def is_open(self):
-        return bool(self.hwnd and self.user32.IsWindow(self.hwnd))
+        hwnd = self._find_window()
+        if hwnd:
+            self.hwnd = hwnd
+            return True
+        return False
 
     def close(self):
         hwnd = self._find_window() or self.hwnd
@@ -582,6 +617,7 @@ class ChromeController:
     VK_F4 = 0x73
     VK_ENTER = 0x0D
     VK_BACK = 0x08
+    VK_DELETE = 0x2E
     VK_PRIOR = 0x21
     VK_NEXT = 0x22
 
@@ -680,8 +716,22 @@ class ChromeController:
         self.focus()
         self._send_key_chord(*keys)
 
-    def shortcut_foreground(self, *keys):
-        """Send a shortcut to the current app without switching to Chrome."""
+    def shortcut_foreground(self, *keys, fallback_hwnd=None):
+        """Send a shortcut to the current app, recovering focus from Astra if needed."""
+        hwnd = self.user32.GetForegroundWindow()
+        if hwnd and "desktop ai assistant" in self.foreground_title().lower():
+            hwnd = fallback_hwnd
+        if not hwnd:
+            hwnd = fallback_hwnd
+        if not hwnd:
+            raise RuntimeError("I couldn't find the active application to receive that shortcut.")
+        if self.user32.IsIconic(hwnd):
+            self.user32.ShowWindow(hwnd, self.SW_RESTORE)
+        self.user32.BringWindowToTop(hwnd)
+        if (not self.user32.SetForegroundWindow(hwnd) and
+                self.user32.GetForegroundWindow() != hwnd):
+            raise RuntimeError("Windows would not focus the active application. Click its window and try again.")
+        time.sleep(0.05)
         self._send_key_chord(*keys)
 
     def foreground_title(self):
@@ -1599,6 +1649,7 @@ class Companion(QWidget):
         self.chrome_controller = None
         self.last_opened_browser = None
         self.last_typed_text = ""
+        self.select_all_pending_delete = False
         self.command_target_hwnd = None
         self.pending_chrome_type = False
         self.pending_chrome_delete = False
@@ -1682,6 +1733,11 @@ class Companion(QWidget):
     def handle_voice_command(self, command):
         self.set_status(f"Heard: {command}")
         normalized = command.strip().lower()
+        if self.chrome_controller is not None:
+            foreground_hwnd = self.chrome_controller.user32.GetForegroundWindow()
+            if (foreground_hwnd and
+                    "desktop ai assistant" not in self.chrome_controller.foreground_title().lower()):
+                self.command_target_hwnd = foreground_hwnd
 
         if self.notes_save_prompt:
             if "select save" in normalized or normalized == "save":
@@ -1731,6 +1787,11 @@ class Companion(QWidget):
                 self.say(f"I couldn't save that filename: {exc}. Please say the filename again.")
             return
 
+        if (is_exit_notes_command(normalized) or normalized in ("close notes", "close notepad")) and (
+                self.notes_session_active or self.notes_window is not None):
+            self.exit_notes()
+            return
+
         if self.pending_chrome_type:
             self.pending_chrome_type = False
             if normalized in ("cancel", "cancel typing"):
@@ -1741,6 +1802,7 @@ class Companion(QWidget):
                     self.chrome_controller = ChromeController()
                 self.chrome_controller.type_text_foreground(command.strip())
                 self.last_typed_text = command.strip()
+                self.select_all_pending_delete = False
                 self.say("Typed into the focused field.")
             except Exception as exc:
                 self.say(f"I couldn't type into the focused field: {exc}")
@@ -1778,7 +1840,8 @@ class Companion(QWidget):
             self.save_notes()
             return
 
-        if "open notepad" in normalized:
+        if ("open notepad" in normalized or
+                normalized in ("open notes", "launch notepad", "launch notes")):
             self.open_notepad()
             return
 
@@ -1827,6 +1890,12 @@ class Companion(QWidget):
         if (is_exit_notes_command(normalized) or
                 (normalized == "exit" and self.notes_window is not None)):
             self.exit_notes()
+            return
+
+        # An unrecognized delete phrase must not fall through to broad
+        # natural-language close or exit handling.
+        if normalized == "delete" or normalized.startswith("delete "):
+            self.say("I couldn't interpret that delete command. Select text first, or say 'delete last three words'.")
             return
 
         if is_exit_command(command):
@@ -1904,7 +1973,9 @@ class Companion(QWidget):
                                "new tab", "close tab", "next tab", "previous tab", "prev tab",
                                "switch to next tab", "switch to previous tab", "switch to prev tab",
                                "scroll down", "scroll up",
-                               "enter", "press enter", "hit enter", "submit", "delete", "delete word")):
+                               "enter", "press enter", "hit enter", "submit", "delete", "delete word",
+                               "select all", "select everything", "copy", "cut", "paste", "payst", "pay st",
+                               "undo", "redo")):
             return False
 
         if normalized == "exit chrome":
@@ -1922,19 +1993,58 @@ class Companion(QWidget):
             if self.chrome_controller is None:
                 self.chrome_controller = ChromeController()
             controller = self.chrome_controller
-            if type_match:
+            control_shortcuts = {
+                "select all": (controller.VK_CONTROL, ord("A")),
+                "select everything": (controller.VK_CONTROL, ord("A")),
+                "copy": (controller.VK_CONTROL, ord("C")),
+                "cut": (controller.VK_CONTROL, ord("X")),
+                "paste": (controller.VK_CONTROL, ord("V")),
+                "payst": (controller.VK_CONTROL, ord("V")),
+                "pay st": (controller.VK_CONTROL, ord("V")),
+                "undo": (controller.VK_CONTROL, ord("Z")),
+                "redo": (controller.VK_CONTROL, ord("Y")),
+            }
+            if normalized in control_shortcuts:
+                controller.shortcut_foreground(
+                    *control_shortcuts[normalized], fallback_hwnd=self.command_target_hwnd
+                )
+                if normalized in ("select all", "select everything"):
+                    self.select_all_pending_delete = True
+                elif normalized in ("cut", "paste", "payst", "pay st", "undo", "redo"):
+                    self.select_all_pending_delete = False
+                action_messages = {
+                    "select all": "Selected all text",
+                    "select everything": "Selected all text",
+                    "copy": "Copied the selection",
+                    "cut": "Cut the selection",
+                    "paste": "Pasted the clipboard contents",
+                    "payst": "Pasted the clipboard contents",
+                    "pay st": "Pasted the clipboard contents",
+                    "undo": "Undid the last action",
+                    "redo": "Redid the last action",
+                }
+                self.say(f"{action_messages[normalized]} in the active application.")
+            elif type_match:
                 text = (type_match.group(1) or "").strip()
                 if text:
                     controller.type_text_foreground(text)
                     self.last_typed_text = text
+                    self.select_all_pending_delete = False
                     self.say("Typed into the focused field.")
                 else:
                     self.pending_chrome_type = True
                     self.say("What should I type? Focus a text field in the active app, then dictate the words. Say ‘cancel’ to stop.")
             elif normalized == "delete":
-                controller.focus()
-                self.pending_chrome_delete = True
-                self.say("What should I delete from the end of the focused field? Say the words, or say ‘delete last n words’. Say ‘cancel’ to stop.")
+                if self.select_all_pending_delete:
+                    controller.shortcut_foreground(
+                        controller.VK_DELETE, fallback_hwnd=self.command_target_hwnd
+                    )
+                    self.select_all_pending_delete = False
+                    self.say("Deleted the selected text in the active application.")
+                else:
+                    controller.focus()
+                    self.pending_chrome_delete = True
+                    self.say("What should I delete from the end of the focused field? Say the words, or say ‘delete last n words’. Say ‘cancel’ to stop.")
             elif normalized == "delete word":
                 controller.delete_previous_words(1)
                 self.say("Deleted the last word from the focused Chrome field.")
@@ -1989,24 +2099,35 @@ class Companion(QWidget):
             elif normalized == "new tab":
                 active_title = controller.foreground_title().lower()
                 new_tab_key = ord("N") if "notepad" in active_title else ord("T")
-                controller.shortcut_foreground(controller.VK_CONTROL, new_tab_key)
+                controller.shortcut_foreground(
+                    controller.VK_CONTROL, new_tab_key, fallback_hwnd=self.command_target_hwnd
+                )
                 self.say("Opened a new tab in the active application.")
             elif normalized == "close tab":
-                controller.shortcut_foreground(controller.VK_CONTROL, ord("W"))
+                controller.shortcut_foreground(
+                    controller.VK_CONTROL, ord("W"), fallback_hwnd=self.command_target_hwnd
+                )
                 self.say("Closed the current tab in the active application.")
             elif normalized in ("next tab", "switch to next tab"):
-                controller.shortcut_foreground(controller.VK_CONTROL, controller.VK_TAB)
+                controller.shortcut_foreground(
+                    controller.VK_CONTROL, controller.VK_TAB, fallback_hwnd=self.command_target_hwnd
+                )
                 self.say("Switched to the next tab.")
             elif normalized in ("previous tab", "prev tab", "switch to previous tab", "switch to prev tab"):
                 controller.shortcut_foreground(
-                    controller.VK_CONTROL, controller.VK_SHIFT, controller.VK_TAB
+                    controller.VK_CONTROL, controller.VK_SHIFT, controller.VK_TAB,
+                    fallback_hwnd=self.command_target_hwnd,
                 )
                 self.say("Switched to the previous tab.")
             elif normalized == "scroll down":
-                controller.shortcut_foreground(controller.VK_NEXT)
+                controller.shortcut_foreground(
+                    controller.VK_NEXT, fallback_hwnd=self.command_target_hwnd
+                )
                 self.say("Scrolling down in the active application.")
             elif normalized == "scroll up":
-                controller.shortcut_foreground(controller.VK_PRIOR)
+                controller.shortcut_foreground(
+                    controller.VK_PRIOR, fallback_hwnd=self.command_target_hwnd
+                )
                 self.say("Scrolling up in the active application.")
             elif normalized in ("enter", "press enter", "hit enter", "submit"):
                 controller.shortcut(controller.VK_ENTER)
