@@ -14,6 +14,7 @@ A small desktop AI assistant prototype with an original, holographic interface a
 - Voice commands for browsers, Windows apps, tabs, focused-app editing, and window management
 - Uses the installed Windows Aria voice first for low-latency speech, with Microsoft's online Aria voice as a fallback
 - Microphone input and speech recognition through SpeechRecognition and Google Speech Recognition (internet required)
+- WebRTC voice activity filtering drops clips without a sustained speech-like signal before speech recognition
 - Tray menu to show or exit
 
 ## Requirements
@@ -46,7 +47,9 @@ If PowerShell blocks activation, use Command Prompt instead:
 
 ## Voice Command Reference
 
-Say “Astra” to wake the assistant. After it responds, continue speaking without repeating the wake word. Commands can be chained in order, for example “scroll down, then close tab.” Treat `type` as a text-entry command: everything after it in that utterance is typed literally.
+Say “Astra” to wake the assistant. After it responds, continue speaking without repeating the wake word. Commands can be chained in order, for example “scroll down, then close tab.” Treat `type` as a text-entry command: dictated words are entered literally, and a destination phrase such as `in the search field` tells Astra where to put them.
+
+Noise filtering uses WebRTC voice activity detection. It helps ignore non-speech sounds, but it cannot tell a nearby person from speech playing through a speaker.
 
 ### Assistant and notes
 - `goodbye` exits Astra. `hide` / `go away` / `dismiss` hides the overlay; `show` / `come back` / `appear` brings it back. Ask `what time is it` for the current time.
@@ -59,7 +62,7 @@ Say “Astra” to wake the assistant. After it responds, continue speaking with
 - `open Chrome`, `open Edge`, `open Brave`, `open Firefox`, or `open Opera` opens that browser. Then `search for cats` searches in the browser you opened. You can name a browser directly with `search in Brave for cats` or `search for cats in Brave`.
 - `search for ...` / `search ...` searches in the active browser, then the last browser opened, or Chrome if no browser is selected. `search it` / `search for it` uses the last text Astra typed.
 - `new tab`, `close tab`, `next tab`, and `previous tab` (also `prev tab`) act on the active app. `reload`, `go back`, `go forward`, and `exit Chrome` control Chrome. `scroll up` and `scroll down` act on the active app.
-- `type hello world` types the entire remainder literally into the focused field: for example, `type paste`, `type delete`, and `type new tab` type those words instead of running those commands. To run another action, say it in a separate utterance after typing. Say `type` by itself to have Astra prompt for text. `enter`, `press enter`, `hit enter`, or `submit` submits the focused field.
+- `type hello world` types the entire remainder literally. Astra uses the focused editable field; if none is focused, it can select a clearly labeled page search field or ask which field to use. In Chrome, distinguish the page search box from the omnibox with `type cats in the search field` and `type cats in the address bar`. You can also say `type my name in the name field`. Astra says what it heard and which field received it so you can catch a recognition mistake. If Astra asks which field, say its name or number, such as `search field` or `second`. Say `type` by itself to have Astra prompt for text. Commands like `type paste`, `type delete`, and `type new tab` type those words instead of running them. `enter`, `return`, `press enter`, `hit enter`, or `submit` submits the focused field in the active application.
 
 ### Focused-app editing
 These commands send keyboard shortcuts to the currently focused application or field, including Notepad:
@@ -71,7 +74,7 @@ These commands send keyboard shortcuts to the currently focused application or f
 - `minimize` / `minimise` minimizes the active app. Add an app name to target it, such as `minimize Notepad` or `minimise Chrome`. `minimize all` minimizes visible application windows while leaving Astra available.
 - `maximize Chrome` / `maximise Chrome` maximizes a named app. Astra restores a minimized window first, reports if it is already maximized, and says the app is not opened if no matching window is found.
 - `open Recycle Bin`, `open Control Panel`, `open This PC`, `open Downloads`, `open Documents`, `open Pictures`, `open Music`, `open Videos`, `open Task Manager`, `open Calculator`, `open Paint`, and `open Snipping Tool` open common Windows locations and tools. `open files` / `open File Explorer`, `open Store`, and `open settings` are also supported.
-- Say `open` followed by an installed app's name to launch it; Astra searches Start Menu shortcuts, registered app paths, and `PATH`. Say `close` followed by an app name to close its window.
+- Say `open` followed by an installed app's name to launch it; Astra searches Start Menu shortcuts, registered app paths, and `PATH`. Say `close` followed by an app name to close its window. For any app whose native or in-window confirmation exposes its prompt text and buttons, Astra reads those options and waits for your choice. Reply with a displayed button name, such as `save`, `don't save`, `cancel`, or `close all`, or say `the second option`. This uses `pywinauto` UI Automation, included in `requirements.txt`; if an app does not expose its prompt, Astra reports that and won't guess.
 - App name aliases include `VS` → Visual Studio; `VS Code`, `VSC`, or `vscode` → Visual Studio Code; `MS Word` → Word; `MS Excel` → Excel; `MS PowerPoint`, `MS PPT`, or `PPT` → PowerPoint; `MS Outlook` → Outlook; `MS OneNote` → OneNote; `MS Teams` → Teams; `VLC` → VLC Media Player; and `OBS` → OBS Studio.
 
 ### Chaining commands

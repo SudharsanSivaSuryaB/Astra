@@ -18,9 +18,40 @@ from PySide6.QtWidgets import (
     QMenu, QSystemTrayIcon, QStyle
 )
 
+try:
+    from pywinauto import Desktop as UIAutomationDesktop
+except ImportError:
+    UIAutomationDesktop = None
+
+try:
+    import webrtcvad
+except ImportError:
+    webrtcvad = None
+
+try:
+    import pyttsx3
+except ImportError:
+    pyttsx3 = None
+
+try:
+    import pyperclip
+except ImportError:
+    pyperclip = None
+
 RECOGNITION_LANGUAGE = "en-IN"
+
 CONVERSATION_IDLE_TIMEOUT_SECONDS = 30
+
 FEMALE_TTS_VOICE = "en-US-AriaNeural"
+
+VOICE_ACTIVITY_VAD_MODE = 2
+
+VOICE_ACTIVITY_FRAME_MS = 20
+
+VOICE_ACTIVITY_MIN_VOICED_FRAMES = 4
+
+VOICE_ACTIVITY_MIN_RATIO = 0.08
+
 WAKE_WORD_VARIANTS = ("astra", "astro", "a star", "a straw",
     "ASS-truh",
     "AHS-truh",
@@ -43,30 +74,22 @@ WAKE_WORD_VARIANTS = ("astra", "astro", "a star", "a straw",
     "ASS-trə",
     "AH-stra"
 )
-EXIT_PHRASES = (
-    "goodbye", "good bye", "bye bye", "that's all", "that is all",
-    "exit", "quit", "shut down", "close astra", "close the assistant",
-)
 
+EXIT_PHRASES = ("goodbye",)
 
 def is_exit_command(text):
-    normalized = text.strip().lower()
-    if any(phrase in normalized for phrase in ("exit notes", "exit notepad", "stop notes")):
-        return False
-    return any(phrase in normalized for phrase in EXIT_PHRASES)
-
+    normalized = " ".join(re.sub(r"[^a-z0-9 ]+", " ", text.lower()).split())
+    return normalized in EXIT_PHRASES
 
 def is_exit_notes_command(text):
     normalized = text.strip().lower()
     return "exit notes" in normalized or "exit notepad" in normalized
-
 
 def is_stop_notes_command(text):
     normalized = text.strip().lower()
     return any(phrase in normalized for phrase in (
         "stop notes", "staff notes", "top notes", "end notes"
     ))
-
 
 def find_wake_word(text):
     normalized = re.sub(r"[^a-z0-9 ]+", " ", text.lower())
@@ -79,7 +102,6 @@ def find_wake_word(text):
         return "extra"
     return ""
 
-
 def remove_wake_word(text):
     for variant in (*WAKE_WORD_VARIANTS, "extra"):
         if variant == "extra" and text.strip().lower() != "extra":
@@ -88,7 +110,6 @@ def remove_wake_word(text):
         if match:
             return (text[:match.start()] + text[match.end():]).strip(" ,.!?")
     return text.strip(" ,.!?")
-
 
 class VoiceCommandSequenceParser:
     """Split command sequences using registered command families, not command pairs."""
@@ -184,9 +205,7 @@ class VoiceCommandSequenceParser:
             parts.append(final_part)
         return parts
 
-
 VOICE_COMMAND_SEQUENCES = VoiceCommandSequenceParser()
-
 
 def register_voice_command_starter(pattern):
     """Add a command family's opening pattern to compound-command parsing.
@@ -196,34 +215,21 @@ def register_voice_command_starter(pattern):
     """
     VOICE_COMMAND_SEQUENCES.register_command_starter(pattern)
 
-
 for _starter_pattern in (
     r"(?:open|launch|start|close)\b",
     r"exit\s+(?:chrome|notepad|notes)\b",
     r"(?:take|start|stop|exit|save)\s+notes\b",
     r"(?:type|search|reload|go\s+back|go\s+forward|new\s+tab|close\s+tab|"
     r"(?:switch\s+to\s+)?(?:next|previous|prev)\s+tab|"
-    r"scroll\s+(?:up|down)|(?:hit|press)\s+enter|enter|delete|"
+    r"scroll\s+(?:up|down)|(?:hit|press)\s+(?:enter|return)|(?:enter|return)|delete|"
     r"select\s+all|select\s+everything|copy|cut|paste|pay\s*st|undo|redo)\b",
     r"(?:minimi[sz]e|maximi[sz]e|hide|show)\b",
     r"(?:what\s+time|tell\s+me\s+the\s+time|goodbye)\b",
 ):
     register_voice_command_starter(_starter_pattern)
 
-
 def split_compound_commands(command):
     return VOICE_COMMAND_SEQUENCES.split(command)
-
-try:
-    import pyttsx3
-except ImportError:
-    pyttsx3 = None
-
-try:
-    import pyperclip
-except ImportError:
-    pyperclip = None
-
 
 class SpeechWorker(QThread):
     speech_started = Signal(str)
@@ -250,17 +256,9 @@ class SpeechWorker(QThread):
                     raise RuntimeError("Windows does not expose an installed Aria voice to SAPI.")
                 engine.setProperty("voice", aria.id)
                 engine.setProperty("rate", 190)
-                started = {"value": False}
-
-                def on_started(_name):
-                    started["value"] = True
-                    self.speech_started.emit(self.text)
-
-                engine.connect("started-utterance", on_started)
                 engine.say(self.text)
+                self.speech_started.emit(self.text)
                 engine.runAndWait()
-                if not started["value"]:
-                    self.speech_started.emit(self.text)
                 self.success = True
                 return
             except (OSError, subprocess.SubprocessError) as exc:
@@ -296,7 +294,6 @@ class SpeechWorker(QThread):
 
         self.error = f"{local_error} Online Aria is not installed."
 
-
 class Win32MouseInput(ctypes.Structure):
     _fields_ = [
         ("dx", wintypes.LONG),
@@ -307,7 +304,6 @@ class Win32MouseInput(ctypes.Structure):
         ("dwExtraInfo", ctypes.c_size_t),
     ]
 
-
 class Win32KeyBdInput(ctypes.Structure):
     _fields_ = [
         ("wVk", wintypes.WORD),
@@ -317,14 +313,12 @@ class Win32KeyBdInput(ctypes.Structure):
         ("dwExtraInfo", ctypes.c_size_t),
     ]
 
-
 class Win32HardwareInput(ctypes.Structure):
     _fields_ = [
         ("uMsg", wintypes.DWORD),
         ("wParamL", wintypes.WORD),
         ("wParamH", wintypes.WORD),
     ]
-
 
 class Win32InputUnion(ctypes.Union):
     # INPUT's union must include MOUSEINPUT so its size matches the Win32 ABI.
@@ -334,11 +328,9 @@ class Win32InputUnion(ctypes.Union):
         ("hi", Win32HardwareInput),
     ]
 
-
 class Win32Input(ctypes.Structure):
     _anonymous_ = ("data",)
     _fields_ = [("type", wintypes.DWORD), ("data", Win32InputUnion)]
-
 
 class NotesWindow:
     """Open Notepad, focus it, and type dictated Unicode text through Win32."""
@@ -600,7 +592,6 @@ class NotesWindow:
         if hwnd:
             self.user32.PostMessageW(hwnd, self.WM_CLOSE, 0, 0)
 
-
 class ChromeController:
     """Launch Chrome and control the active Chrome window on Windows."""
     SW_RESTORE = 9
@@ -802,11 +793,15 @@ class ChromeController:
         return True
 
 class WindowsAppController:
-    """Resolve common Windows apps and Start Menu shortcuts by spoken name."""
+
     WM_CLOSE = 0x0010
+
     SW_MINIMIZE = 6
+
     SW_MAXIMIZE = 3
+
     SW_RESTORE = 9
+
     PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
     BROWSER_EXECUTABLES = {
@@ -816,6 +811,7 @@ class WindowsAppController:
         "firefox": ("firefox.exe", "firefox"),
         "opera": ("opera.exe", "opera"),
     }
+
     NATIVE_DESTINATIONS = {
         "recycle_bin": ("shell", "RecycleBinFolder", "Recycle Bin"),
         "control_panel": ("shell", "ControlPanelFolder", "Control Panel"),
@@ -830,6 +826,7 @@ class WindowsAppController:
         "paint": ("exe", "mspaint.exe", "Paint"),
         "snipping_tool": ("exe", "snippingtool.exe", "Snipping Tool"),
     }
+
     APP_NAME_ALIASES = {
         "vs": "visual studio",
         "visual studio": "visual studio",
@@ -859,6 +856,7 @@ class WindowsAppController:
         "vlc": "vlc media player",
         "obs": "obs studio",
     }
+
     APP_EXECUTABLES = {
         "visual studio": ("devenv.exe", "devenv"),
         "visual studio code": ("code.exe", "code"),
@@ -874,6 +872,33 @@ class WindowsAppController:
     @staticmethod
     def normalize_name(value):
         return " ".join(re.sub(r"[^a-z0-9 ]+", " ", value.lower()).split())
+
+    @classmethod
+    def is_confirmation_button_label(cls, value):
+        label = cls.normalize_name(value)
+        action_starts = (
+            "save", "dont save", "don t save", "do not save", "dont close", "don t close",
+            "do not close", "dont exit", "don t exit", "do not exit", "discard", "cancel",
+            "close", "yes", "no", "exit", "quit", "end task", "force quit",
+            "keep", "stay", "leave", "continue", "ok", "overwrite", "replace",
+            "stop", "terminate", "restart", "apply",
+        )
+        return any(label == action or label.startswith(action + " ") for action in action_starts)
+
+    @classmethod
+    def is_confirmation_prompt_text(cls, value):
+        text = cls.normalize_name(value)
+        return bool(re.search(
+            r"\bare you sure\b|\bdo you want\b|\bconfirm\b|\bconfirmation\b|"
+            r"\bunsaved\b|\bchanges? will be lost\b|\bwill be lost\b|"
+            r"\b(?:close|exit|quit) without saving\b|\bthis will close\b|\bclose (?:this|the|current) (?:app|application|window|file|document)\b|"
+            r"\b(?:close|exit|quit) (?:the )?(?:app|application|window|file|document|workspace|project|session|tabs?)\b|"
+            r"\bbefore (?:closing|close|exiting|exit|quitting|quit)\b|"
+            r"\bclose all (?:tabs|windows|documents|files)\b|\byou have \d+ tabs? open\b|"
+            r"\b(save|close|exit|quit|overwrite|replace|discard) (?:all )?(?:changes|files|windows|tabs|documents)\b|"
+            r"\bend task\b|\bforce quit\b",
+            text,
+        ))
 
     @classmethod
     def aliases(cls, target):
@@ -1146,6 +1171,7 @@ class WindowsAppController:
         user32.PostMessageW.argtypes = (wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
 
         matches = []
+        process_ids = set()
         callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
         def visit(hwnd, _):
@@ -1171,13 +1197,388 @@ class WindowsAppController:
                 matched = alias in title or alias in cls.normalize_name(image_name.removesuffix(".exe"))
             if matched:
                 matches.append(hwnd)
+                process_ids.add(process_id.value)
             return True
 
         callback = callback_type(visit)
         user32.EnumWindows(callback, 0)
         for hwnd in matches:
             user32.PostMessageW(hwnd, cls.WM_CLOSE, 0, 0)
-        return bool(matches)
+        if not matches:
+            return None
+        return {"hwnds": [int(hwnd) for hwnd in matches], "pids": sorted(process_ids)}
+
+    @classmethod
+    def find_close_confirmation(cls, process_ids, excluded_hwnds=()):
+        """Find a visible confirmation dialog belonging to an app being closed."""
+        if os.name != "nt" or not process_ids:
+            return None
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.EnumWindows.argtypes = (
+            ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM), wintypes.LPARAM,
+        )
+        user32.EnumWindows.restype = wintypes.BOOL
+        user32.EnumChildWindows.argtypes = (
+            wintypes.HWND, ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM),
+            wintypes.LPARAM,
+        )
+        user32.IsWindowVisible.argtypes = (wintypes.HWND,)
+        user32.IsWindowVisible.restype = wintypes.BOOL
+        user32.GetWindowThreadProcessId.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
+        user32.GetWindowTextLengthW.argtypes = (wintypes.HWND,)
+        user32.GetWindowTextLengthW.restype = ctypes.c_int
+        user32.GetWindowTextW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+        user32.GetClassNameW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+
+        excluded = {int(hwnd) for hwnd in excluded_hwnds}
+        candidates = []
+        enum_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def read_text(hwnd):
+            length = user32.GetWindowTextLengthW(hwnd)
+            buffer = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, buffer, len(buffer))
+            return buffer.value.strip()
+
+        def visit_window(hwnd, _):
+            if not user32.IsWindowVisible(hwnd) or int(hwnd) in excluded:
+                return True
+            process_id = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
+            if process_id.value not in process_ids:
+                return True
+
+            class_buffer = ctypes.create_unicode_buffer(128)
+            user32.GetClassNameW(hwnd, class_buffer, len(class_buffer))
+            child_texts = []
+            buttons = []
+
+            def visit_child(child_hwnd, _child_data):
+                child_text = read_text(child_hwnd)
+                if child_text:
+                    child_texts.append(child_text)
+                    child_class = ctypes.create_unicode_buffer(128)
+                    user32.GetClassNameW(child_hwnd, child_class, len(child_class))
+                    if child_class.value.lower() == "button":
+                        buttons.append({"hwnd": int(child_hwnd), "label": child_text})
+                return True
+
+            child_callback = enum_type(visit_child)
+            user32.EnumChildWindows(hwnd, child_callback, 0)
+            options = [
+                button for button in buttons
+                if cls.is_confirmation_button_label(button["label"])
+            ]
+            is_standard_dialog = class_buffer.value == "#32770"
+            prompt_text = " ".join(
+                text for text in child_texts
+                if cls.normalize_name(text) not in {
+                    cls.normalize_name(button["label"]) for button in buttons
+                }
+            )
+            looks_like_prompt = cls.is_confirmation_prompt_text(prompt_text)
+            if options and (is_standard_dialog or looks_like_prompt or len(options) >= 2):
+                candidates.append({
+                    "hwnd": int(hwnd),
+                    "title": read_text(hwnd),
+                    "text": prompt_text,
+                    "buttons": options,
+                })
+            return True
+
+        callback = enum_type(visit_window)
+        user32.EnumWindows(callback, 0)
+        return candidates[0] if candidates else cls.find_uia_close_confirmation(process_ids)
+
+    @classmethod
+    def find_uia_close_confirmation(cls, process_ids):
+        """Read confirmation text and buttons from an app's UI Automation tree."""
+        if UIAutomationDesktop is None:
+            return None
+        try:
+            windows = UIAutomationDesktop(backend="uia").windows()
+        except Exception:
+            return None
+
+        for window in windows:
+            try:
+                if window.element_info.process_id not in process_ids:
+                    continue
+                title = window.window_text().strip()
+                window_rect = window.rectangle()
+                controls = []
+                for control in window.descendants():
+                    try:
+                        info = control.element_info
+                        name = (info.name or control.window_text() or "").strip()
+                        rect = info.rectangle
+                        bounds = (rect.left, rect.top, rect.right, rect.bottom)
+                        if name and bounds[2] > bounds[0] and bounds[3] > bounds[1]:
+                            controls.append({
+                                "name": name,
+                                "normalized": cls.normalize_name(name),
+                                "type": info.control_type,
+                                "bounds": bounds,
+                                "control": control,
+                            })
+                    except Exception:
+                        continue
+
+                markers = [
+                    item for item in controls
+                    if item["type"] != "Button" and cls.is_confirmation_prompt_text(item["name"])
+                ]
+                if title and cls.is_confirmation_prompt_text(title):
+                    markers.append({
+                        "name": title,
+                        "normalized": cls.normalize_name(title),
+                        "type": "Window",
+                        "bounds": (window_rect.left, window_rect.top, window_rect.right, window_rect.bottom),
+                    })
+                markers.sort(key=lambda item: (
+                    (item["bounds"][2] - item["bounds"][0]) *
+                    (item["bounds"][3] - item["bounds"][1])
+                ))
+                for marker in markers:
+                    left, top, right, bottom = marker["bounds"]
+                    # Scope choices to the area around the confirmation text. This
+                    # avoids reading or selecting unrelated toolbar/page controls.
+                    region = (left - 100, top - 45, right + 420, bottom + 360)
+
+                    def in_prompt_region(item):
+                        item_left, item_top, item_right, item_bottom = item["bounds"]
+                        center_x = (item_left + item_right) / 2
+                        center_y = (item_top + item_bottom) / 2
+                        return (region[0] <= center_x <= region[2] and
+                                region[1] <= center_y <= region[3])
+
+                    prompt_controls = [item for item in controls if in_prompt_region(item)]
+                    options = []
+                    seen_options = set()
+                    for item in prompt_controls:
+                        if item["type"] != "Button" or not cls.is_confirmation_button_label(item["name"]):
+                            continue
+                        key = (item["normalized"], item["bounds"])
+                        if key in seen_options:
+                            continue
+                        seen_options.add(key)
+                        options.append({
+                            "hwnd": 0,
+                            "label": item["name"],
+                            "uia_control": item["control"],
+                        })
+                    if not options:
+                        continue
+
+                    relevant_text = [marker["name"]]
+                    for item in prompt_controls:
+                        normalized = item["normalized"]
+                        is_context = (
+                            cls.is_confirmation_prompt_text(item["name"]) or
+                            re.search(r"don.?t ask me again|tabs? open|changes? will be lost", normalized)
+                        )
+                        if item["type"] != "Button" and is_context:
+                            if item["name"] not in relevant_text:
+                                relevant_text.append(item["name"])
+                    return {
+                        "hwnd": int(window.handle),
+                        "title": title,
+                        "text": " ".join(relevant_text),
+                        "buttons": options,
+                        "uia": True,
+                    }
+            except Exception:
+                continue
+        return None
+
+    @classmethod
+    def find_editable_fields(cls, target_hwnd):
+        """Return visible, editable controls in the active app, including focused state."""
+        if UIAutomationDesktop is None or not target_hwnd or os.name != "nt":
+            return []
+        try:
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            user32.GetWindowThreadProcessId.argtypes = (
+                wintypes.HWND, ctypes.POINTER(wintypes.DWORD),
+            )
+            target_process_id = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(
+                wintypes.HWND(int(target_hwnd)), ctypes.byref(target_process_id)
+            )
+            desktop_windows = UIAutomationDesktop(backend="uia").windows()
+        except Exception:
+            return []
+
+        matching_windows = []
+        exact_windows = []
+        process_windows = []
+        for window in desktop_windows:
+            try:
+                if int(window.handle) == int(target_hwnd):
+                    exact_windows.append(window)
+                elif getattr(window.element_info, "process_id", None) == target_process_id.value:
+                    process_windows.append(window)
+            except Exception:
+                continue
+        # Scope Chrome to the active top-level window. Its process owns other
+        # windows too, so scanning every same-process root creates duplicate bars.
+        matching_windows = exact_windows or process_windows
+
+        fields = []
+        seen_bounds = {}
+        for window in matching_windows:
+            try:
+                for control in window.descendants():
+                    try:
+                        info = control.element_info
+                        control_type = info.control_type
+                        if control_type not in ("Edit", "ComboBox", "Document"):
+                            continue
+                        if not control.is_visible() or not control.is_enabled():
+                            continue
+                        rect = info.rectangle
+                        bounds = (rect.left, rect.top, rect.right, rect.bottom)
+                        if bounds[2] <= bounds[0] or bounds[3] <= bounds[1]:
+                            continue
+                        focused = bool(control.has_keyboard_focus())
+                        if control_type == "Document" and not focused:
+                            continue
+                        name = (info.name or control.window_text() or "").strip()
+                        automation_id = (getattr(info, "auto_id", "") or "").strip()
+                        label = name or automation_id or "text field"
+                        search_context = cls.normalize_name(f"{name} {automation_id}")
+                        search_words = set(search_context.split())
+                        is_address_bar = bool(search_words & {"address", "url", "omnibox"})
+                        search_score = 0 if is_address_bar else sum(
+                            term in search_words
+                            for term in ("search", "find", "query", "filter")
+                        )
+                        field = {
+                            "label": label,
+                            "automation_id": automation_id,
+                            "control_type": control_type,
+                            "focused": focused,
+                            "search_score": search_score,
+                            "is_address_bar": is_address_bar,
+                            "bounds": bounds,
+                            "control": control,
+                        }
+                        bounds_key = bounds
+                        existing_index = seen_bounds.get(bounds_key)
+                        if existing_index is None:
+                            seen_bounds[bounds_key] = len(fields)
+                            fields.append(field)
+                        elif (focused and not fields[existing_index]["focused"]) or (
+                                control_type == "Edit" and
+                                fields[existing_index]["control_type"] == "ComboBox"):
+                            fields[existing_index] = field
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+        # Some browser UIA trees expose several wrappers for the same omnibox.
+        # In one active window, treat all of those wrappers as one logical field.
+        deduplicated = []
+        address_bar_index = None
+        for field in fields:
+            if not field["is_address_bar"]:
+                deduplicated.append(field)
+                continue
+            if address_bar_index is None:
+                address_bar_index = len(deduplicated)
+                deduplicated.append(field)
+                continue
+            current = deduplicated[address_bar_index]
+            rank = lambda item: (
+                item["focused"], item["control_type"] == "Edit",
+                -item["bounds"][1], -item["bounds"][0],
+            )
+            if rank(field) > rank(current):
+                deduplicated[address_bar_index] = field
+        return deduplicated
+
+    @staticmethod
+    def choose_close_confirmation(dialog, spoken_choice):
+        """Click the requested visible dialog button, returning its label or None."""
+        if os.name != "nt" or not dialog:
+            return None
+        normalized = WindowsAppController.normalize_name(spoken_choice)
+        spoken_option = re.sub(
+            r"^(?:please\s+)?(?:choose|select|click|press|pick)\s+(?:(?:the|option|button)\s+)*",
+            "",
+            normalized,
+        )
+        choice_map = (
+            (("dont save", "don t save", "do not save", "discard", "no save"),
+             ("dont save", "don t save", "do not save", "discard")),
+            (("save all",), ("save all",)),
+            (("save",), ("save",)),
+            (("close all",), ("close all",)),
+            (("cancel", "keep open", "stop closing", "never mind", "stay", "not now"),
+             ("cancel", "keep open", "cancel close", "cancel closing", "stay")),
+            (("yes",), ("yes",)),
+            (("no",), ("no",)),
+            (("overwrite", "replace"), ("overwrite", "replace")),
+            (("exit", "quit", "close", "continue", "end task", "force quit", "leave"),
+             ("exit", "quit", "close", "continue", "end task", "force quit", "leave")),
+            (("ok", "okay"), ("ok", "okay")),
+        )
+        desired = None
+        for spoken_aliases, button_aliases in choice_map:
+            if any(re.search(rf"\b{re.escape(alias)}\b", spoken_option) for alias in spoken_aliases):
+                desired = button_aliases
+                break
+        ordinal_match = re.search(r"\b(first|second|third|1st|2nd|3rd)\s+option\b", normalized)
+        if ordinal_match:
+            index = {"first": 0, "1st": 0, "second": 1, "2nd": 1, "third": 2, "3rd": 2}[ordinal_match.group(1)]
+            if index < len(dialog["buttons"]):
+                button = dialog["buttons"][index]
+                desired = (WindowsAppController.normalize_name(button["label"]),)
+        if desired is None:
+            matching_labels = tuple(
+                WindowsAppController.normalize_name(button["label"])
+                for button in dialog["buttons"]
+                if (WindowsAppController.normalize_name(button["label"]) == spoken_option or
+                    re.search(
+                        rf"\b{re.escape(WindowsAppController.normalize_name(button['label']))}\b",
+                        spoken_option,
+                    ))
+            )
+            desired = matching_labels or (spoken_option,)
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.IsWindow.argtypes = (wintypes.HWND,)
+        user32.IsWindow.restype = wintypes.BOOL
+        user32.SendMessageW.argtypes = (wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+        # Prefer the exact button so saying "save" cannot accidentally choose "Save All".
+        for button in dialog["buttons"]:
+            label = WindowsAppController.normalize_name(button["label"])
+            if label in desired:
+                if button.get("uia_control") is not None:
+                    try:
+                        button["uia_control"].click_input()
+                        return button["label"]
+                    except Exception:
+                        continue
+                hwnd = wintypes.HWND(button["hwnd"])
+                if user32.IsWindow(hwnd):
+                    user32.SendMessageW(hwnd, 0x00F5, 0, 0)  # BM_CLICK
+                    return button["label"]
+        for button in dialog["buttons"]:
+            label = WindowsAppController.normalize_name(button["label"])
+            if any(alias not in ("save", "yes", "no") and label.startswith(alias + " ")
+                   for alias in desired):
+                if button.get("uia_control") is not None:
+                    try:
+                        button["uia_control"].click_input()
+                        return button["label"]
+                    except Exception:
+                        continue
+                hwnd = wintypes.HWND(button["hwnd"])
+                if user32.IsWindow(hwnd):
+                    user32.SendMessageW(hwnd, 0x00F5, 0, 0)  # BM_CLICK
+                    return button["label"]
+        return None
 
     @classmethod
     def minimize_foreground_app(cls, fallback_hwnd=None):
@@ -1383,7 +1784,6 @@ class WindowsAppController:
         user32.EnumWindows(callback, 0)
         return counts
 
-
 class VoiceListener(QThread):
     command = Signal(str)
     status = Signal(str)
@@ -1395,14 +1795,50 @@ class VoiceListener(QThread):
         self.stop_event = threading.Event()
         self.pause_event = threading.Event()
         self.keep_conversation_event = threading.Event()
+        self.hold_conversation_event = threading.Event()
         self.resume_conversation_event = threading.Event()
         self.wake_response_finished = threading.Event()
+        self.vad = webrtcvad.Vad(VOICE_ACTIVITY_VAD_MODE) if webrtcvad is not None else None
+
+    def contains_human_voice(self, audio):
+        """Reject clips without a sustained speech-like signal before cloud ASR."""
+        if self.vad is None:
+            return True
+        try:
+            raw_audio = audio.get_raw_data(convert_rate=16000, convert_width=2)
+            frame_size = int(16000 * VOICE_ACTIVITY_FRAME_MS / 1000) * 2
+            voiced_frames = 0
+            longest_voiced_run = 0
+            current_voiced_run = 0
+            total_frames = len(raw_audio) // frame_size
+            for frame_index in range(total_frames):
+                start = frame_index * frame_size
+                frame = raw_audio[start:start + frame_size]
+                if self.vad.is_speech(frame, 16000):
+                    voiced_frames += 1
+                    current_voiced_run += 1
+                    longest_voiced_run = max(longest_voiced_run, current_voiced_run)
+                else:
+                    current_voiced_run = 0
+            if not total_frames:
+                return False
+            required_voiced_frames = max(
+                VOICE_ACTIVITY_MIN_VOICED_FRAMES,
+                int(total_frames * VOICE_ACTIVITY_MIN_RATIO + 0.999),
+            )
+            return (voiced_frames >= required_voiced_frames and longest_voiced_run >= 3)
+        except Exception:
+            # A malformed or unsupported clip should not crash the microphone loop.
+            return True
 
     def run(self):
         try:
             with SoundDeviceMicrophone() as source:
                 self.recognizer.adjust_for_ambient_noise(source, duration=0.7)
-                self.status.emit("Listening for ‘Astra’…")
+                if self.vad is None:
+                    self.status.emit("Voice filter unavailable; install requirements.txt. Listening for ‘Astra’…")
+                else:
+                    self.status.emit("Listening for ‘Astra’…")
                 conversation_active = False
                 last_activity = 0.0
                 while not self.stop_event.is_set():
@@ -1415,6 +1851,7 @@ class VoiceListener(QThread):
                         self.resume_conversation_event.clear()
                         self.status.emit("Conversation active. Go ahead; no need to repeat ‘Astra’.")
                     if (conversation_active and not self.keep_conversation_event.is_set() and
+                            not self.hold_conversation_event.is_set() and
                             time.monotonic() - last_activity >= CONVERSATION_IDLE_TIMEOUT_SECONDS):
                         conversation_active = False
                         self.status.emit("Wake mode: say ‘Astra’ (or ‘Astro’), or ‘goodbye’ to exit.")
@@ -1428,20 +1865,34 @@ class VoiceListener(QThread):
                         )
                     except sr.WaitTimeoutError:
                         continue
+                    if not self.contains_human_voice(audio):
+                        continue
                     try:
                         recognized_text = self.recognizer.recognize_google(
                             audio, language=RECOGNITION_LANGUAGE
                         ).strip()
                         heard = recognized_text.lower()
                     except sr.UnknownValueError:
-                        if conversation_active or self.keep_conversation_event.is_set():
-                            self.status.emit("I didn’t catch that. Try speaking closer to the microphone.")
-                        else:
+                        if (conversation_active and not self.keep_conversation_event.is_set() and
+                                not self.hold_conversation_event.is_set() and
+                                time.monotonic() - last_activity >= CONVERSATION_IDLE_TIMEOUT_SECONDS):
+                            conversation_active = False
+                            self.status.emit("Wake mode: say ‘Astra’ (or ‘Astro’), or ‘goodbye’ to exit.")
+                        elif conversation_active or self.keep_conversation_event.is_set():
                             self.status.emit("I didn’t catch that. Try speaking closer to the microphone.")
                         continue
                     except sr.RequestError:
                         self.status.emit("Speech recognition is unavailable. Check your internet connection.")
                         continue
+
+                    # A listen may start before the idle deadline and finish after it.
+                    # Recheck here so a wake word captured at that boundary is handled
+                    # in wake mode instead of being discarded as a conversational reply.
+                    if (conversation_active and not self.keep_conversation_event.is_set() and
+                            not self.hold_conversation_event.is_set() and
+                            time.monotonic() - last_activity >= CONVERSATION_IDLE_TIMEOUT_SECONDS):
+                        conversation_active = False
+                        self.status.emit("Wake mode: say ‘Astra’ (or ‘Astro’), or ‘goodbye’ to exit.")
 
                     if conversation_active:
                         last_activity = time.monotonic()
@@ -1474,6 +1925,8 @@ class VoiceListener(QThread):
                         continue
                     try:
                         command_audio = self.recognizer.listen(source, timeout=5, phrase_time_limit=5)
+                        if not self.contains_human_voice(command_audio):
+                            continue
                         command = self.recognizer.recognize_google(
                             command_audio, language=RECOGNITION_LANGUAGE
                         ).lower()
@@ -1496,7 +1949,6 @@ class VoiceListener(QThread):
 
     def resume(self):
         self.pause_event.clear()
-
 
 class SoundDeviceMicrophone(sr.AudioSource):
     """SpeechRecognition audio source backed by sounddevice (no PyAudio build)."""
@@ -1534,7 +1986,6 @@ class SoundDeviceMicrophone(sr.AudioSource):
         def read(self, size):
             data, overflowed = self.audio_stream.read(size)
             return bytes(data)
-
 
 class CharacterArt(QWidget):
     """An original, minimal holographic assistant emblem drawn with Qt."""
@@ -1629,8 +2080,8 @@ class CharacterArt(QWidget):
         p.drawLine(107, 209, 115, 190)
         p.drawLine(119, 197, 148, 197)
 
-
 class Companion(QWidget):
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Astra | Desktop AI Assistant")
@@ -1652,6 +2103,9 @@ class Companion(QWidget):
         self.select_all_pending_delete = False
         self.command_target_hwnd = None
         self.pending_chrome_type = False
+        self.pending_type_text = None
+        self.pending_type_fields = []
+        self.pending_type_attempts = 0
         self.pending_chrome_delete = False
         self.notes_window = None
         self.notes_active = False
@@ -1660,6 +2114,8 @@ class Companion(QWidget):
         self.notes_save_filename_pending = False
         self.notes_save_check_pending = False
         self.close_after_save_filename = False
+        self.pending_app_close_watch = None
+        self.pending_app_close_confirmation = None
 
         self.bubble = QLabel("Say ‘Astra’ followed by a command.")
         self.bubble.setWordWrap(True)
@@ -1739,6 +2195,14 @@ class Companion(QWidget):
                     "desktop ai assistant" not in self.chrome_controller.foreground_title().lower()):
                 self.command_target_hwnd = foreground_hwnd
 
+        if self.pending_app_close_confirmation and not is_exit_command(command):
+            if self.handle_app_close_confirmation_reply(command):
+                return
+        elif is_exit_command(command):
+            self.pending_app_close_confirmation = None
+            self.pending_app_close_watch = None
+            self.listener.hold_conversation_event.clear()
+
         if self.notes_save_prompt:
             if "select save" in normalized or normalized == "save":
                 if self.notes_window:
@@ -1792,20 +2256,55 @@ class Companion(QWidget):
             self.exit_notes()
             return
 
+        if self.pending_type_text is not None:
+            if normalized in ("cancel", "cancel typing", "never mind"):
+                self.pending_type_text = None
+                self.pending_type_fields = []
+                self.pending_type_attempts = 0
+                self.say("Field selection cancelled.")
+                return
+
+            selected_field = self.select_pending_type_field(command)
+            if selected_field is None:
+                choices = ", ".join(
+                    f"{field['label']} (say {index})"
+                    for index, field in enumerate(self.pending_type_fields, start=1)
+                )
+                if VOICE_COMMAND_SEQUENCES.is_command_start(command):
+                    # A new command cancels the pending choice and continues normally.
+                    self.pending_type_text = None
+                    self.pending_type_fields = []
+                    self.pending_type_attempts = 0
+                    self.handle_voice_command(command)
+                    return
+                else:
+                    self.pending_type_attempts += 1
+                    if self.pending_type_attempts >= 2:
+                        self.pending_type_text = None
+                        self.pending_type_fields = []
+                        self.pending_type_attempts = 0
+                        self.say("I couldn't match that to a field, so I cancelled typing. Say type again with a field name, or focus a field first.")
+                    else:
+                        self.say(f"I still need a field choice. Say a field name or its number: {choices}. Say cancel to stop.")
+                    return
+
+            text = self.pending_type_text
+            self.pending_type_text = None
+            self.pending_type_fields = []
+            self.pending_type_attempts = 0
+            self.type_into_active_field(text, selected_field=selected_field)
+            return
+
         if self.pending_chrome_type:
             self.pending_chrome_type = False
             if normalized in ("cancel", "cancel typing"):
-                self.say("Chrome typing cancelled.")
+                self.say("Typing cancelled.")
                 return
-            try:
-                if self.chrome_controller is None:
-                    self.chrome_controller = ChromeController()
-                self.chrome_controller.type_text_foreground(command.strip())
-                self.last_typed_text = command.strip()
-                self.select_all_pending_delete = False
-                self.say("Typed into the focused field.")
-            except Exception as exc:
-                self.say(f"I couldn't type into the focused field: {exc}")
+            text, destination = self.parse_type_payload(command.strip())
+            if text:
+                self.type_into_active_field(text, destination=destination)
+            else:
+                self.say("I didn't catch what to type. Say the words, or say cancel.")
             return
 
         if self.pending_chrome_delete:
@@ -1910,9 +2409,6 @@ class Companion(QWidget):
         elif any(word in command for word in ("show", "come back", "appear")):
             self.show()
             self.say("I’m here.")
-        elif any(word in command for word in ("exit", "quit", "shut down", "close")):
-            self.listener.stop()
-            self.close()
         elif any(word in command for word in ("hello", "hi", "good morning", "good evening")):
             self.greet()
         else:
@@ -1955,8 +2451,226 @@ class Companion(QWidget):
         }
         return counts.get(token)
 
+    @staticmethod
+    def parse_type_payload(payload):
+        """Split spoken text from an optional destination such as 'in search'."""
+        payload = payload.strip()
+        destination_first = re.match(
+            r"^(?:in|into|to)\s+(?:the\s+)?(.+?)\s+(?:text\s+)?(field|box|bar|input)\s+(.+?)\s*[.!?]*$",
+            payload,
+            re.IGNORECASE,
+        )
+        if destination_first:
+            destination = destination_first.group(1).strip()
+            text = destination_first.group(3).strip()
+            destination = re.sub(r"^(?:(?:the|current|active)\s+)+", "", destination, flags=re.IGNORECASE)
+            if WindowsAppController.normalize_name(destination) in ("text", ""):
+                return text, None
+            return text, destination
+
+        destination_match = re.match(
+            r"^(.+?)\s+(?:in|into|to)\s+(?:the\s+)?(.+?)\s*[.!?]*$",
+            payload,
+            re.IGNORECASE,
+        )
+        if not destination_match:
+            return payload, None
+
+        text = destination_match.group(1).strip()
+        destination = re.sub(r"[.!?,]+$", "", destination_match.group(2)).strip()
+        destination = re.sub(r"\s+please$", "", destination, flags=re.IGNORECASE).strip()
+        normalized_destination = WindowsAppController.normalize_name(destination)
+        field_suffix = re.search(r"\b(?:text\s+)?(?:field|box|bar|input)\s*$", normalized_destination)
+        generic_suffix = re.fullmatch(r"(?:text\s+)?(?:field|box|input)", normalized_destination)
+        known_field_terms = {
+            "search", "find", "query", "filter", "address", "url", "website",
+            "email", "mail", "username", "password", "message", "chat", "comment",
+            "subject", "name", "title", "phone", "recipient", "to", "from",
+        }
+        destination_base = re.sub(
+            r"\b(?:text\s+)?(?:field|box|bar|input)\s*$", "", normalized_destination
+        )
+        destination_base = re.sub(r"^(?:(?:the|current|active)\s+)+", "", destination_base).strip()
+        destination_words = destination_base.split()
+        has_known_field_term = bool(destination_words and destination_words[-1] in known_field_terms)
+        if not (field_suffix or has_known_field_term):
+            return payload, None
+
+        if generic_suffix:
+            return text, None
+        destination = re.sub(
+            r"\b(?:text\s+)?(?:field|box|bar|input)\s*$", "", destination,
+            flags=re.IGNORECASE,
+        )
+        destination = re.sub(r"^(?:(?:the|current|active)\s+)+", "", destination, flags=re.IGNORECASE)
+        destination = destination.strip(" .,!?")
+        return text, destination or None
+
+    def select_pending_type_field(self, spoken_choice):
+        """Resolve a spoken number or label against the pending field choices."""
+        choice = WindowsAppController.normalize_name(spoken_choice.strip(" .!?"))
+        if not choice:
+            return None
+        ordinal_map = {
+            "first": 1, "one": 1, "1": 1, "first field": 1, "option one": 1,
+            "second": 2, "two": 2, "2": 2, "second field": 2, "option two": 2,
+            "third": 3, "three": 3, "3": 3, "third field": 3, "option three": 3,
+            "fourth": 4, "four": 4, "4": 4, "fourth field": 4, "option four": 4,
+        }
+        choice = re.sub(r"^(?:the|use|choose|select)\s+", "", choice)
+        choice = re.sub(r"\b(?:text\s+)?(?:field|box|bar|input)\s*$", "", choice).strip()
+        for prefix, number in (("first ", 1), ("second ", 2), ("third ", 3), ("fourth ", 4)):
+            if choice.startswith(prefix):
+                choice = str(number)
+                break
+        number = ordinal_map.get(choice)
+        if number and number <= len(self.pending_type_fields):
+            return self.pending_type_fields[number - 1]
+
+        matching_fields = []
+        for field in self.pending_type_fields:
+            label = WindowsAppController.normalize_name(field["label"])
+            choice_words = set(choice.split())
+            label_words = set(label.split())
+            if choice == label or choice in label or label in choice or choice_words.issubset(label_words):
+                matching_fields.append(field)
+        choice_words = set(choice.split())
+        if "search" in choice_words and not choice_words & {"address", "url"}:
+            page_search_fields = [
+                field for field in matching_fields if not field.get("is_address_bar", False)
+            ]
+            matching_fields = page_search_fields
+        if len(matching_fields) > 1:
+            labels = {WindowsAppController.normalize_name(field["label"]) for field in matching_fields}
+            if len(labels) == 1:
+                return max(matching_fields, key=lambda field: (
+                    field["focused"], field["control_type"] == "Edit",
+                    -field["bounds"][1], -field["bounds"][0],
+                ))
+        return matching_fields[0] if len(matching_fields) == 1 else None
+
+    def type_into_active_field(self, text, destination=None, selected_field=None):
+        """Focus a UIA text field when possible, then paste the recognized dictation."""
+        text = text.strip()
+        if not text:
+            self.say("I didn't catch any words to type.")
+            return
+
+        if selected_field is None:
+            fields = WindowsAppController.find_editable_fields(self.command_target_hwnd)
+            if destination:
+                selector = WindowsAppController.normalize_name(destination)
+                selector_aliases = {
+                    "url": ("url", "address"), "website": ("website", "address", "url"),
+                    "address": ("address", "url"), "email": ("email", "mail"),
+                    "mail": ("mail", "email"), "search": ("search", "find", "query"),
+                    "find": ("find", "search", "query"), "query": ("query", "search"),
+                }
+                field_hints = {
+                    "search", "find", "query", "filter", "address", "url", "website",
+                    "email", "mail", "username", "password", "message", "chat", "comment",
+                    "subject", "name", "title", "phone", "recipient", "to", "from",
+                }
+                selector_hints = [word for word in selector.split() if word in field_hints]
+                if selector_hints:
+                    selector_terms = tuple(
+                        alias
+                        for hint in selector_hints
+                        for alias in selector_aliases.get(hint, (hint,))
+                    )
+                else:
+                    selector_terms = (selector,)
+                matching_fields = []
+                for field in fields:
+                    searchable = WindowsAppController.normalize_name(
+                        f"{field['label']} {field.get('automation_id', '')}"
+                    )
+                    searchable_words = set(searchable.split())
+                    if any(
+                        term and set(term.split()).issubset(searchable_words)
+                        for term in selector_terms
+                    ):
+                        matching_fields.append(field)
+                selector_words = set(selector.split())
+                address_requested = bool(selector_words & {"address", "url", "omnibox"})
+                search_requested = bool(selector_words & {"search", "find", "query", "filter"})
+                if address_requested:
+                    address_fields = [
+                        field for field in matching_fields if field.get("is_address_bar", False)
+                    ]
+                    if address_fields:
+                        matching_fields = address_fields
+                elif search_requested:
+                    page_search_fields = [
+                        field for field in matching_fields if not field.get("is_address_bar", False)
+                    ]
+                    matching_fields = page_search_fields
+                if not matching_fields:
+                    self.say(f"I couldn't find a {destination} field in the active app. Focus it and try again, or name another field.")
+                    return
+                if len(matching_fields) > 1:
+                    self.ask_which_type_field(text, matching_fields)
+                    return
+                selected_field = matching_fields[0]
+            else:
+                focused_fields = [
+                    field for field in fields
+                    if field["focused"] and field["control_type"] in ("Edit", "ComboBox")
+                ]
+                if len(focused_fields) == 1:
+                    selected_field = focused_fields[0]
+                elif len(focused_fields) > 1:
+                    self.ask_which_type_field(text, focused_fields)
+                    return
+                else:
+                    search_fields = [field for field in fields if field["search_score"]]
+                    if len(search_fields) == 1:
+                        selected_field = search_fields[0]
+                    elif not search_fields and len(fields) == 1:
+                        selected_field = fields[0]
+                    elif fields:
+                        candidates = search_fields if search_fields else fields
+                        self.ask_which_type_field(text, candidates)
+                        return
+                    else:
+                        self.say("I couldn't locate an editable field in the active app. Focus the field first, or say ‘type cats in the search field’ so I can look for it.")
+                        return
+
+        try:
+            if self.chrome_controller is None:
+                self.chrome_controller = ChromeController()
+            field_name = "the focused field"
+            if selected_field is not None:
+                selected_field["control"].set_focus()
+                field_name = selected_field["label"]
+            self.chrome_controller.type_text_foreground(text)
+            self.last_typed_text = text
+            self.select_all_pending_delete = False
+            if selected_field and "password" in WindowsAppController.normalize_name(field_name):
+                self.say("I typed the recognized dictation into the password field.")
+            else:
+                self.say(f'I heard "{text}" and typed it into {field_name}.')
+        except Exception as exc:
+            self.say(f"I couldn't type into the selected field: {exc}")
+
+    def ask_which_type_field(self, text, fields):
+        self.pending_type_text = text
+        self.pending_type_fields = fields
+        self.pending_type_attempts = 0
+        choices = ", ".join(
+            f"{field['label']} (say {index})"
+            for index, field in enumerate(fields, start=1)
+        )
+        self.say(f"I heard {text}. Which field should I use? I found {choices}. Say a field name or its number, or say cancel.")
+
     def handle_chrome_command(self, command, normalized):
         normalized = normalized.strip(" .!?,")
+        close_tab_match = re.fullmatch(
+            r"(?:please\s+)?close\s+(?:(?:the|current|active)\s+)?tab"
+            r"(?:\s+in\s+(?:the\s+)?(?:current|active)\s+application)?"
+            r"(?:\s+please)?",
+            normalized,
+        )
         search_match = re.match(r"^search(?:\s+for)?\s+(.+?)\s*$", command.strip(), re.IGNORECASE)
         search_in_browser_match = re.match(
             r"^search\s+in\s+(chrome|google\s+chrome|edge|microsoft\s+edge|brave|firefox|opera)\s+for\s+(.+?)\s*$",
@@ -1973,9 +2687,9 @@ class Companion(QWidget):
                                "new tab", "close tab", "next tab", "previous tab", "prev tab",
                                "switch to next tab", "switch to previous tab", "switch to prev tab",
                                "scroll down", "scroll up",
-                               "enter", "press enter", "hit enter", "submit", "delete", "delete word",
+                               "enter", "press enter", "hit enter", "return", "press return", "hit return", "submit", "delete", "delete word",
                                "select all", "select everything", "copy", "cut", "paste", "payst", "pay st",
-                               "undo", "redo")):
+                               "undo", "redo") or close_tab_match):
             return False
 
         if normalized == "exit chrome":
@@ -2025,15 +2739,12 @@ class Companion(QWidget):
                 }
                 self.say(f"{action_messages[normalized]} in the active application.")
             elif type_match:
-                text = (type_match.group(1) or "").strip()
+                text, destination = self.parse_type_payload((type_match.group(1) or "").strip())
                 if text:
-                    controller.type_text_foreground(text)
-                    self.last_typed_text = text
-                    self.select_all_pending_delete = False
-                    self.say("Typed into the focused field.")
+                    self.type_into_active_field(text, destination=destination)
                 else:
                     self.pending_chrome_type = True
-                    self.say("What should I type? Focus a text field in the active app, then dictate the words. Say ‘cancel’ to stop.")
+                    self.say("What should I type? I'll use the focused field, or find a clear search field. You can say ‘cats in the search field’. Say cancel to stop.")
             elif normalized == "delete":
                 if self.select_all_pending_delete:
                     controller.shortcut_foreground(
@@ -2103,7 +2814,7 @@ class Companion(QWidget):
                     controller.VK_CONTROL, new_tab_key, fallback_hwnd=self.command_target_hwnd
                 )
                 self.say("Opened a new tab in the active application.")
-            elif normalized == "close tab":
+            elif close_tab_match:
                 controller.shortcut_foreground(
                     controller.VK_CONTROL, ord("W"), fallback_hwnd=self.command_target_hwnd
                 )
@@ -2129,9 +2840,11 @@ class Companion(QWidget):
                     controller.VK_PRIOR, fallback_hwnd=self.command_target_hwnd
                 )
                 self.say("Scrolling up in the active application.")
-            elif normalized in ("enter", "press enter", "hit enter", "submit"):
-                controller.shortcut(controller.VK_ENTER)
-                self.say("Submitted the focused Chrome field.")
+            elif normalized in ("enter", "press enter", "hit enter", "return", "press return", "hit return", "submit"):
+                controller.shortcut_foreground(
+                    controller.VK_ENTER, fallback_hwnd=self.command_target_hwnd
+                )
+                self.say("Submitted the focused field in the active application.")
             elif normalized in ("delete", "delete word"):
                 controller.shortcut(controller.VK_CONTROL, controller.VK_BACK)
                 self.say("Deleted the previous word in the focused Chrome field.")
@@ -2225,11 +2938,95 @@ class Companion(QWidget):
             else:
                 closed = WindowsAppController.close_app(target)
                 if closed:
-                    self.say(f"Closing {target}.")
+                    watch = {
+                        "target": target,
+                        "hwnds": closed["hwnds"],
+                        "pids": closed["pids"],
+                        "attempts": 0,
+                    }
+                    self.pending_app_close_watch = watch
+                    self.listener.hold_conversation_event.set()
+                    QTimer.singleShot(450, self.check_app_close_confirmation)
+                    self.say(f"I asked {target} to close. I'll check whether it needs your choice.")
                 else:
                     self.say(f"I couldn't find an open window for {target}.")
         except Exception as exc:
             self.say(str(exc))
+        return True
+
+    def check_app_close_confirmation(self):
+        watch = self.pending_app_close_watch
+        if not watch:
+            return
+        dialog = WindowsAppController.find_close_confirmation(
+            watch["pids"], excluded_hwnds=watch["hwnds"]
+        )
+        if dialog:
+            self.pending_app_close_watch = None
+            self.pending_app_close_confirmation = {"watch": watch, "dialog": dialog}
+            options = [button["label"] for button in dialog["buttons"]]
+            detail = (dialog["text"] or dialog["title"] or watch["target"])[:220]
+            self.say(
+                f"{watch['target']} needs a choice before closing. It says: {detail}. "
+                f"The available choices are {', '.join(options)}. Tell me the option to choose."
+            )
+            return
+
+        watch["attempts"] += 1
+        if watch["attempts"] < 12:
+            QTimer.singleShot(450, self.check_app_close_confirmation)
+        else:
+            self.pending_app_close_watch = None
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            user32.IsWindow.argtypes = (wintypes.HWND,)
+            user32.IsWindow.restype = wintypes.BOOL
+            user32.IsWindowVisible.argtypes = (wintypes.HWND,)
+            user32.IsWindowVisible.restype = wintypes.BOOL
+            visible_target_hwnd = next((
+                hwnd for hwnd in watch["hwnds"]
+                if user32.IsWindow(wintypes.HWND(hwnd)) and user32.IsWindowVisible(wintypes.HWND(hwnd))
+            ), None)
+            if visible_target_hwnd is None:
+                self.listener.hold_conversation_event.clear()
+                self.say(f"{watch['target']} closed successfully.")
+            else:
+                self.listener.hold_conversation_event.clear()
+                self.say(
+                    f"{watch['target']} is still open, but its confirmation controls weren't accessible to Astra. "
+                    "Please choose an option on screen; I won't guess."
+                )
+
+    def handle_app_close_confirmation_reply(self, command):
+        pending = self.pending_app_close_confirmation
+        if not pending:
+            return False
+        selected = WindowsAppController.choose_close_confirmation(pending["dialog"], command)
+        if not selected:
+            options = [button["label"] for button in pending["dialog"]["buttons"]]
+            self.say(f"I didn't match that to a choice. Say {', '.join(options)}, or say the first, second, or third option.")
+            return True
+
+        self.pending_app_close_confirmation = None
+        selected_normalized = WindowsAppController.normalize_name(selected)
+        dialog_context = WindowsAppController.normalize_name(
+            pending["dialog"].get("text", "") + " " + pending["dialog"].get("title", "")
+        )
+        cancel_choice = selected_normalized in (
+            "cancel", "keep open", "cancel close", "cancel closing", "stay",
+            "dont close", "don t close", "do not close", "dont exit", "don t exit", "do not exit",
+        ) or selected_normalized.startswith("keep ")
+        if selected_normalized == "no" and "save" not in dialog_context:
+            cancel_choice = True
+        if cancel_choice:
+            self.pending_app_close_watch = None
+            self.listener.hold_conversation_event.clear()
+            self.say(f"I selected {selected}. The close operation is cancelled.")
+        else:
+            watch = pending["watch"]
+            watch["attempts"] = 0
+            self.pending_app_close_watch = watch
+            QTimer.singleShot(500, self.check_app_close_confirmation)
+            self.say(f"I selected {selected}. I'll continue and check for any next prompt.")
         return True
 
     def open_notepad(self):
@@ -2338,10 +3135,8 @@ class Companion(QWidget):
             self.say(f"I heard you say, {command}. I can help with the time, date, greetings, and desktop controls. What would you like to try?")
 
     def say(self, text):
-        if self.speech_worker is None:
-            self.set_status(text)
-            self.bubble.repaint()
-        self.art.set_speaking(True)
+        # Update the overlay immediately; speech generation and playback run in a worker.
+        self.set_status(text)
         self.listener.pause()
         self.speech_queue.append(text)
         self.start_next_speech()
@@ -2462,7 +3257,6 @@ class Companion(QWidget):
         if self.speech_worker is not None:
             self.speech_worker.wait(5000)
         event.accept()
-
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
