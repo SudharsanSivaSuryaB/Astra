@@ -18,6 +18,10 @@ from PySide6.QtWidgets import (
     QMenu, QSystemTrayIcon, QStyle
 )
 
+from Components.constants import RECOGNITION_LANGUAGE,CONVERSATION_IDLE_TIMEOUT_SECONDS,FEMALE_TTS_VOICE,VOICE_ACTIVITY_VAD_MODE,VOICE_ACTIVITY_FRAME_MS,VOICE_ACTIVITY_MIN_VOICED_FRAMES,VOICE_ACTIVITY_MIN_RATIO
+
+from Components.wake_and_exit import WAKE_WORD_VARIANTS, EXIT_PHRASES
+
 try:
     from pywinauto import Desktop as UIAutomationDesktop
 except ImportError:
@@ -38,44 +42,8 @@ try:
 except ImportError:
     pyperclip = None
 
-RECOGNITION_LANGUAGE = "en-IN"
 
-CONVERSATION_IDLE_TIMEOUT_SECONDS = 30
 
-FEMALE_TTS_VOICE = "en-US-AriaNeural"
-
-VOICE_ACTIVITY_VAD_MODE = 2
-
-VOICE_ACTIVITY_FRAME_MS = 20
-
-VOICE_ACTIVITY_MIN_VOICED_FRAMES = 4
-
-VOICE_ACTIVITY_MIN_RATIO = 0.08
-
-WAKE_WORD_VARIANTS = ("astra", "astro", "a star", "a straw",
-    "ASS-truh",
-    "AHS-truh",
-    "AS-tra",
-    "AHSS-tra",
-    "UHSS-truh",
-    "AS-t ruh",
-    "AAS-truh",
-    "ASS-trah",
-    "AHSS-trah",
-    "AZ-truh",
-    "AS-dra",
-    "ASH-truh",
-    "AS-ṭra",
-    "A-struh",
-    "ASS-tuh-ruh",
-    "AS-TRA",
-    "AAS-TRA",
-    "UHSS-TRA",
-    "ASS-trə",
-    "AH-stra"
-)
-
-EXIT_PHRASES = ("goodbye",)
 
 def is_exit_command(text):
     normalized = " ".join(re.sub(r"[^a-z0-9 ]+", " ", text.lower()).split())
